@@ -13,7 +13,7 @@
 //! encoded the way the merged segment is.
 //!
 //! A field with a `pool_factor` above 1 pools every document's token
-//! vectors as they are buffered (see [`token_pooling`]) and marks them in
+//! vectors as they are buffered (see [`TokenPooling`]) and marks them in
 //! the segment's document table with that factor. A merge pools the
 //! documents still marked as ingested, which is how turning pooling on for
 //! an existing field (a Reindex) pools its stored vectors, and leaves
@@ -25,7 +25,7 @@
 //! later segment with them. Segments written before that are stored as
 //! [`INTERIM_KIND`] and converted by a later merge.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +37,9 @@ use crate::storage::Storage;
 use crate::vector::core::distance::DistanceMetric;
 use crate::vector::core::field::multi_vector_params_error;
 use crate::vector::core::multi_vector::{BinaryParams, MultiVectorStorage, OwnedCodec};
-use crate::vector::core::token_pooling::{self, pooled_count};
+use crate::vector::core::token_pooling::{
+    POOLING_BUDGET_BYTES, PooledTokens, TokenPooling, pool_windows, pooled_count, pooling_bytes,
+};
 use crate::vector::core::vector::Vector;
 use crate::vector::index::config::MultiVectorIndexConfig;
 use crate::vector::index::multivector::LAYOUT;
@@ -54,7 +56,7 @@ use crate::vector::index::segment::segmented_core::SegmentedCore;
 use crate::vector::index::{VectorIndex, VectorIndexStats};
 use crate::vector::reader::VectorIndexReader;
 use crate::vector::search::searcher::VectorIndexSearcher;
-use crate::vector::writer::VectorIndexWriter;
+use crate::vector::writer::{FieldVectors, VectorIndexWriter};
 
 /// Element kind of the segments a `Binary` field writes before it has
 /// learned its parameters.
@@ -186,16 +188,23 @@ impl Shared {
         }
     }
 
-    /// Pool one document's token vectors (row-major) by the field's factor,
-    /// re-normalizing the means in a `Cosine` field; `None` when pooling
-    /// leaves them unchanged.
+    /// How this field pools its documents: `None` when it does not pool
+    /// (a factor of 1).
+    fn token_pooling(&self) -> Option<TokenPooling> {
+        (self.config.pool_factor > 1).then(|| {
+            TokenPooling::new(
+                self.config.dimension,
+                self.config.pool_factor,
+                self.config.distance_metric == DistanceMetric::Cosine,
+            )
+        })
+    }
+
+    /// Pool one document's stored token vectors (row-major) by the field's
+    /// factor, re-normalizing the means in a `Cosine` field; `None` when
+    /// pooling leaves them unchanged or the field does not pool.
     fn pool_rows(&self, rows: &[f32]) -> Option<Vec<f32>> {
-        token_pooling::pool(
-            rows,
-            self.config.dimension,
-            self.config.pool_factor,
-            self.config.distance_metric == DistanceMetric::Cosine,
-        )
+        self.token_pooling()?.pool_rows(rows)
     }
 
     fn snapshot(&self) -> Result<MultiVectorSnapshot> {
@@ -214,6 +223,15 @@ impl Shared {
     /// surviving document's payload, so memory stays proportional to the
     /// document count.
     fn merge(&self, segments: Vec<ManagedSegmentInfo>) -> Result<()> {
+        self.merge_within(segments, POOLING_BUDGET_BYTES)
+    }
+
+    /// [`Self::merge`], pooling the documents it pools in windows of at most
+    /// `pooling_budget` bytes (see [`pool_windows`]), each window's documents
+    /// at the same time (Issue #1429). Rows are still read and written in
+    /// doc-id order, and pooling is deterministic, so the merged segment is
+    /// the same whatever the windows and the threads.
+    fn merge_within(&self, segments: Vec<ManagedSegmentInfo>, pooling_budget: usize) -> Result<()> {
         let mut binary = self.binary.lock();
         let mut sources = segments.clone();
         sources.sort_by_key(|s| std::cmp::Reverse(s.generation));
@@ -235,9 +253,10 @@ impl Shared {
                     continue;
                 }
                 let pool = factor > 1 && entry.pool_factor == 0;
+                let stored = entry.vector_count as usize;
                 let entry = if pool {
                     DocEntry {
-                        vector_count: pooled_count(entry.vector_count as usize, factor) as u32,
+                        vector_count: pooled_count(stored, factor) as u32,
                         pool_factor: factor,
                         ..entry
                     }
@@ -245,9 +264,11 @@ impl Shared {
                     entry
                 };
                 survivors.push(Survivor {
+                    shrinks: (entry.vector_count as usize) < stored,
                     entry,
                     source,
                     pool,
+                    stored,
                 });
             }
         }
@@ -273,6 +294,19 @@ impl Shared {
             })
         })?;
 
+        // The survivors pooling shrinks, in write order, grouped into windows
+        // whose documents are pooled at the same time; `pooled` holds the
+        // current window's rows until they are written.
+        let shrinking: Vec<usize> = (0..survivors.len())
+            .filter(|&i| survivors[i].shrinks)
+            .collect();
+        let costs: Vec<usize> = shrinking
+            .iter()
+            .map(|&i| pooling_bytes(survivors[i].stored, self.config.dimension))
+            .collect();
+        let mut windows = pool_windows(&costs, pooling_budget).into_iter();
+        let mut pooled: VecDeque<(u64, Vec<f32>)> = VecDeque::new();
+
         let merged_id = self.core.manager().generate_segment_id();
         write_segment(
             self.core.storage().as_ref(),
@@ -282,18 +316,31 @@ impl Shared {
             &entries,
             |i, sink| {
                 let survivor = &survivors[i];
-                let rows = source_rows(survivor)?;
-                if survivor.pool
-                    && let Some(pooled) = self.pool_rows(&rows.to_f32())
-                {
-                    return sink.write(&pooled);
+                if survivor.shrinks {
+                    if pooled.is_empty() {
+                        let window = windows.next().ok_or_else(|| {
+                            LaurusError::internal("a merge ran out of documents to pool")
+                        })?;
+                        pooled = self
+                            .pool_window(&readers, &survivors, &shrinking[window])?
+                            .into();
+                    }
+                    let (doc_id, rows) =
+                        pooled.pop_front().expect("a pooling window is never empty");
+                    if doc_id != survivor.entry.doc_id {
+                        return Err(LaurusError::internal(format!(
+                            "a merge pooled doc {doc_id} where doc {} belongs",
+                            survivor.entry.doc_id
+                        )));
+                    }
+                    return sink.write(&rows);
                 }
                 // Rows encoded exactly as the target encodes are copied
                 // verbatim (no re-quantization, no compounding loss across
                 // merges); others (the field's `storage` just changed) are
                 // transcoded through f32, which is also how `update_field`
                 // migrates every existing segment to the new kind.
-                sink.append(&rows)
+                sink.append(&source_rows(survivor)?)
             },
         )?;
 
@@ -319,14 +366,56 @@ impl Shared {
         }
         Ok(())
     }
+
+    /// Pool the stored rows of the survivors at `window` (indices into
+    /// `survivors`, all of which pooling shrinks), at the same time under the
+    /// `native` feature and one after another otherwise.
+    ///
+    /// # Returns
+    ///
+    /// Each survivor's doc id and pooled rows, in `window`'s order.
+    fn pool_window(
+        &self,
+        readers: &[Arc<SegmentReader>],
+        survivors: &[Survivor],
+        window: &[usize],
+    ) -> Result<Vec<(u64, Vec<f32>)>> {
+        let pooling = self
+            .token_pooling()
+            .ok_or_else(|| LaurusError::internal("a merge pooled in a field that does not pool"))?;
+        let pool_one = |&i: &usize| -> Result<(u64, Vec<f32>)> {
+            let survivor = &survivors[i];
+            let doc_id = survivor.entry.doc_id;
+            let rows = readers[survivor.source].rows(doc_id)?.ok_or_else(|| {
+                LaurusError::internal("merge source lost a document listed in its table")
+            })?;
+            let pooled = pooling
+                .pool_rows(&rows.to_f32())
+                .ok_or_else(|| LaurusError::internal("a document pooling shrinks did not pool"))?;
+            Ok((doc_id, pooled))
+        };
+        #[cfg(feature = "native")]
+        {
+            use rayon::prelude::*;
+            window.par_iter().map(pool_one).collect()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            window.iter().map(pool_one).collect()
+        }
+    }
 }
 
 /// A document a merge keeps: its entry as the merged segment records it,
-/// the reader it comes from, and whether the merge pools its rows.
+/// the reader it comes from, whether the merge pools its rows (and so
+/// marks it pooled), how many rows it has stored, and whether pooling
+/// shrinks them.
 struct Survivor {
     entry: DocEntry,
     source: usize,
     pool: bool,
+    stored: usize,
+    shrinks: bool,
 }
 
 /// Row-major token vectors to learn [`BinaryParams`] from: every
@@ -562,6 +651,10 @@ impl VectorIndex for MultiVectorIndex {
     fn multi_vector_snapshot(&self, _field: &str) -> Result<Option<MultiVectorSnapshot>> {
         self.snapshot().map(Some)
     }
+
+    fn token_pooling(&self, _field: &str) -> Option<TokenPooling> {
+        self.shared.token_pooling()
+    }
 }
 
 /// Active-segment writer of a [`MultiVectorIndex`].
@@ -613,35 +706,46 @@ impl MultiVectorWriter {
     }
 
     /// Buffer `docs`, each a document's non-empty token vectors in arrival
-    /// order, already checked by [`Self::check_dimensions`]: normalize them
-    /// when the metric needs it, pool them when the field pools, clear the
-    /// documents' deletion marks, and only then replace their buffered
-    /// entries, so a failure leaves the buffer untouched.
+    /// order (already checked by [`Self::check_dimensions`]) and possibly
+    /// the same vectors pooled in advance (Issue #1429): keep the pooled
+    /// vectors when they were pooled the way this field pools, and
+    /// otherwise normalize the vectors when the metric needs it and pool
+    /// them when the field pools; then clear the documents' deletion marks,
+    /// and only then replace their buffered entries, so a failure leaves the
+    /// buffer untouched.
     ///
     /// Every write passes here exactly once (ingest, WAL replay, embedder
-    /// output), so a document is pooled once, deterministically.
-    fn buffer_documents(&mut self, docs: &mut [(u64, Vec<Vector>)]) -> Result<()> {
-        if self.shared.config.distance_metric == DistanceMetric::Cosine {
-            docs.iter_mut()
-                .flat_map(|(_, vectors)| vectors.iter_mut())
-                .for_each(Vector::normalize);
-        }
-        let (factor, dimension) = (self.shared.config.pool_factor, self.shared.config.dimension);
-        for (_, vectors) in docs.iter_mut() {
-            if pooled_count(vectors.len(), factor) == vectors.len() {
-                continue;
-            }
-            let rows: Vec<f32> = vectors
-                .iter()
-                .flat_map(|v| v.data.iter().copied())
-                .collect();
-            if let Some(pooled) = self.shared.pool_rows(&rows) {
-                *vectors = pooled
-                    .chunks_exact(dimension)
-                    .map(|row| Vector::new(row.to_vec()))
-                    .collect();
-            }
-        }
+    /// output), so a document is pooled once, deterministically. Vectors
+    /// pooled under another configuration (the field changed between
+    /// pooling and buffering) are never kept, so the marker
+    /// [`Self::write_with`] stamps always describes the stored rows.
+    fn buffer_documents(
+        &mut self,
+        docs: Vec<(u64, Vec<Vector>, Option<PooledTokens>)>,
+    ) -> Result<()> {
+        let pooling = self.shared.token_pooling();
+        let normalize = self.shared.config.distance_metric == DistanceMetric::Cosine;
+        let docs: Vec<(u64, Vec<Vector>)> = docs
+            .into_iter()
+            .map(|(doc_id, mut vectors, pooled)| {
+                match pooled {
+                    // Kept bit for bit: normalizing pooled rows again can
+                    // change them.
+                    Some(pooled)
+                        if Some(pooled.pooling()) == pooling
+                            && pooled.source_len() == vectors.len() =>
+                    {
+                        vectors = pooled.into_vectors();
+                    }
+                    _ => match pooling.and_then(|pooling| pooling.apply(&vectors)) {
+                        Some(pooled) => vectors = pooled.into_vectors(),
+                        None if normalize => vectors.iter_mut().for_each(Vector::normalize),
+                        None => {}
+                    },
+                }
+                (doc_id, vectors)
+            })
+            .collect();
         self.shared
             .core
             .unmark_deleted(docs.iter().map(|(doc_id, _)| *doc_id))?;
@@ -649,7 +753,7 @@ impl MultiVectorWriter {
             self.mark_changed();
         }
         for (doc_id, vectors) in docs {
-            self.buffer.insert(*doc_id, std::mem::take(vectors));
+            self.buffer.insert(doc_id, vectors);
         }
         Ok(())
     }
@@ -718,25 +822,55 @@ impl VectorIndexWriter for MultiVectorWriter {
         for (doc_id, _, vector) in vectors {
             incoming.entry(doc_id).or_default().push(vector);
         }
-        let mut docs: Vec<(u64, Vec<Vector>)> = incoming.into_iter().collect();
-        self.buffer_documents(&mut docs)
+        self.buffer_documents(
+            incoming
+                .into_iter()
+                .map(|(doc_id, vectors)| (doc_id, vectors, None))
+                .collect(),
+        )
     }
 
     /// Buffer one document's token vectors as [`Self::add_vectors`] does,
-    /// without a field name per token (Issue #1406). This writer serves a
-    /// single field, so the names are ignored and every entry's vectors
-    /// are taken in order.
+    /// without a field name per token (Issue #1406), through
+    /// [`Self::add_prepared_document_vectors`] with nothing pooled in
+    /// advance.
     fn add_document_vectors(
         &mut self,
         doc_id: u64,
         fields: Vec<(String, Vec<Vector>)>,
     ) -> Result<()> {
+        self.add_prepared_document_vectors(
+            doc_id,
+            fields
+                .into_iter()
+                .map(|(field, vectors)| FieldVectors::new(field, vectors))
+                .collect(),
+        )
+    }
+
+    /// Buffer one document's token vectors, keeping vectors pooled in
+    /// advance when they were pooled the way this field pools (Issue
+    /// #1429). This writer serves a single field, so the names are ignored
+    /// and every entry's vectors are taken in order, then pooled together
+    /// as one document: the first entry's pooled vectors were pooled from
+    /// fewer vectors than that, so [`Self::buffer_documents`] does not keep
+    /// them.
+    fn add_prepared_document_vectors(
+        &mut self,
+        doc_id: u64,
+        fields: Vec<FieldVectors>,
+    ) -> Result<()> {
         let mut fields = fields.into_iter();
-        let Some((_, mut vectors)) = fields.next() else {
+        let Some(FieldVectors {
+            mut vectors,
+            pooled,
+            ..
+        }) = fields.next()
+        else {
             return Ok(());
         };
-        for (_, more) in fields {
-            vectors.extend(more);
+        for more in fields {
+            vectors.extend(more.vectors);
         }
         if vectors.is_empty() {
             // Nothing to buffer. Clearing the deletion mark would make the
@@ -746,7 +880,7 @@ impl VectorIndexWriter for MultiVectorWriter {
             return Ok(());
         }
         self.check_dimensions(vectors.iter().map(|vector| (doc_id, vector)))?;
-        self.buffer_documents(&mut [(doc_id, vectors)])
+        self.buffer_documents(vec![(doc_id, vectors, pooled)])
     }
 
     fn finalize(&mut self) -> Result<()> {
@@ -1895,7 +2029,7 @@ mod tests {
     mod pooling {
         use super::*;
         use crate::vector::core::multi_vector::BinaryParams;
-        use crate::vector::core::token_pooling::{self, pooled_count};
+        use crate::vector::core::token_pooling::{self, PooledTokens, TokenPooling, pooled_count};
 
         const DIM: usize = 4;
 
@@ -1976,6 +2110,42 @@ mod tests {
             let snapshot = index.snapshot().unwrap();
             let rows = snapshot.rows(doc_id).unwrap().unwrap();
             rows.as_bytes().to_vec()
+        }
+
+        /// A document's token vectors as embedded, before normalization.
+        fn raw(doc_id: u64, count: usize) -> Vec<Vector> {
+            (0..count).map(|i| Vector::new(token(doc_id, i))).collect()
+        }
+
+        fn flat(vectors: &[Vector]) -> Vec<f32> {
+            vectors
+                .iter()
+                .flat_map(|v| v.data.iter().copied())
+                .collect()
+        }
+
+        fn cosine(factor: u32) -> TokenPooling {
+            TokenPooling::new(DIM, factor, true)
+        }
+
+        /// A document's raw token vectors with the same vectors pooled in
+        /// advance under `pooling`.
+        fn prepared(doc_id: u64, count: usize, pooling: TokenPooling) -> FieldVectors {
+            let vectors = raw(doc_id, count);
+            FieldVectors {
+                pooled: pooling.apply(&vectors),
+                ..FieldVectors::new(FIELD, vectors)
+            }
+        }
+
+        /// Commit one document, given through `add_prepared_document_vectors`,
+        /// as one segment.
+        fn commit_prepared(index: &MultiVectorIndex, doc_id: u64, fields: Vec<FieldVectors>) {
+            let mut writer = index.writer().unwrap();
+            writer
+                .add_prepared_document_vectors(doc_id, fields)
+                .unwrap();
+            writer.commit().unwrap();
         }
 
         fn binary_params(index: &MultiVectorIndex) -> Option<BinaryParams> {
@@ -2128,6 +2298,236 @@ mod tests {
                 Some(BinaryParams::train(DIM, &sample).unwrap())
             );
             assert!(entries(&index).iter().all(|e| e.pool_factor == 2));
+        }
+
+        /// A field that, before pooling was turned on, stored documents of
+        /// several lengths (two too short to pool), a stale copy and a
+        /// deleted document, plus one document a factor-2 field pooled.
+        fn mixed_storage() -> Arc<dyn Storage> {
+            let storage = storage();
+            {
+                let index = open(&storage, MultiVectorStorage::F32, 1);
+                commit_docs(&index, &[(1, 9), (2, 2), (3, 30), (4, 5)]);
+                commit_docs(&index, &[(5, 17), (6, 1), (3, 12)]);
+                index.soft_delete_document(4).unwrap();
+                index.persist_deletions().unwrap();
+            }
+            {
+                let index = open(&storage, MultiVectorStorage::F32, 2);
+                commit_docs(&index, &[(7, 11)]);
+            }
+            storage
+        }
+
+        /// Merge every segment of [`mixed_storage`] into a factor-2 field,
+        /// pooling in windows of `budget` bytes on `threads` threads.
+        ///
+        /// # Returns
+        ///
+        /// The merged index and its one segment's bytes.
+        #[cfg(feature = "native")]
+        fn merged_bytes(budget: usize, threads: usize) -> (MultiVectorIndex, Vec<u8>) {
+            let storage = mixed_storage();
+            let index = open(&storage, MultiVectorStorage::F32, 2);
+            let segments = index.shared.core.manager().list_segments();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| index.shared.merge_within(segments, budget))
+                .unwrap();
+            let merged = index.shared.core.manager().list_segments();
+            assert_eq!(merged.len(), 1);
+            let mut bytes = Vec::new();
+            storage
+                .open_input(&Shared::file_name(&merged[0].segment_id))
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            (index, bytes)
+        }
+
+        /// Issue #1429: a merge pools window by window, each window's
+        /// documents at the same time, and writes the same segment whatever
+        /// the windows and the threads: what ingest by factor 2 stores.
+        #[cfg(feature = "native")]
+        #[test]
+        fn test_merges_write_the_same_segment_whatever_the_windows_and_threads() {
+            let (index, reference) = merged_bytes(usize::MAX, 1);
+            // Documents 1, 3 and 5 shrink; this budget groups 1 and 3.
+            let medium = pooling_bytes(9, DIM) + pooling_bytes(17, DIM);
+            for budget in [0, medium, usize::MAX] {
+                for threads in [1, 4] {
+                    assert_eq!(
+                        merged_bytes(budget, threads).1,
+                        reference,
+                        "budget {budget}, {threads} threads"
+                    );
+                }
+            }
+
+            let fresh = open(&storage(), MultiVectorStorage::F32, 2);
+            commit_docs(&fresh, &[(1, 9), (2, 2), (3, 12), (5, 17), (6, 1), (7, 11)]);
+            for doc_id in [1, 2, 3, 5, 6, 7] {
+                assert_eq!(
+                    raw_rows(&index, doc_id),
+                    raw_rows(&fresh, doc_id),
+                    "doc {doc_id}"
+                );
+            }
+            assert_eq!(vectors_of(&index, 4), None);
+            assert!(entries(&index).iter().all(|e| e.pool_factor == 2));
+        }
+
+        #[test]
+        fn test_token_pooling_reports_the_fields_pooling() {
+            assert_eq!(
+                open(&storage(), MultiVectorStorage::F32, 1).token_pooling(FIELD),
+                None
+            );
+            assert_eq!(
+                open(&storage(), MultiVectorStorage::F32, 3).token_pooling(FIELD),
+                Some(cosine(3))
+            );
+        }
+
+        /// Vectors pooled the way the field pools are stored as they are:
+        /// neither pooled nor normalized again.
+        #[test]
+        fn test_vectors_pooled_the_way_the_field_pools_are_kept_bit_for_bit() {
+            let index = open(&storage(), MultiVectorStorage::F32, 2);
+            // Half the real pooled rows: no longer unit vectors, so
+            // normalizing them again changes them, and not what the writer
+            // pools from the raw vectors.
+            let kept: Vec<Vector> = pooled(1, 7, 2)
+                .as_chunks::<DIM>()
+                .0
+                .iter()
+                .map(|row| Vector::new(row.iter().map(|x| x * 0.5).collect()))
+                .collect();
+            let renormalized: Vec<Vector> = kept.iter().map(Vector::normalized).collect();
+            assert_ne!(flat(&renormalized), flat(&kept));
+            assert_ne!(flat(&kept), pooled(1, 7, 2));
+
+            let tagged = PooledTokens::tagged(cosine(2), 7, kept.clone());
+            commit_prepared(
+                &index,
+                1,
+                vec![FieldVectors {
+                    pooled: Some(tagged),
+                    ..FieldVectors::new(FIELD, raw(1, 7))
+                }],
+            );
+            assert_eq!(vectors_of(&index, 1).unwrap(), flat(&kept));
+            assert_eq!(entries(&index)[0].pool_factor, 2);
+        }
+
+        /// What `TokenPooling::apply` pools outside the writer is what the
+        /// writer stores when it pools the raw vectors itself.
+        #[test]
+        fn test_prepared_vectors_store_what_the_writer_pools() {
+            let docs = [(1, 9), (2, 2), (3, 30)];
+            let index = open(&storage(), MultiVectorStorage::F32, 2);
+            for &(doc_id, count) in &docs {
+                commit_prepared(&index, doc_id, vec![prepared(doc_id, count, cosine(2))]);
+            }
+            let fresh = open(&storage(), MultiVectorStorage::F32, 2);
+            commit_docs(&fresh, &docs);
+            for &(doc_id, _) in &docs {
+                assert_eq!(
+                    raw_rows(&index, doc_id),
+                    raw_rows(&fresh, doc_id),
+                    "doc {doc_id}"
+                );
+            }
+        }
+
+        /// Vectors pooled under another factor are pooled again from the
+        /// raw vectors, so the marker always describes the rows.
+        #[test]
+        fn test_vectors_pooled_by_another_factor_are_pooled_again() {
+            let index = open(&storage(), MultiVectorStorage::F32, 4);
+            commit_prepared(&index, 1, vec![prepared(1, 9, cosine(2))]);
+            assert_eq!(vectors_of(&index, 1).unwrap(), pooled(1, 9, 4));
+            assert_eq!(entries(&index)[0].pool_factor, 4);
+
+            let index = open(&storage(), MultiVectorStorage::F32, 1);
+            commit_prepared(&index, 1, vec![prepared(1, 9, cosine(4))]);
+            assert_eq!(vectors_of(&index, 1).unwrap(), normalized(1, 9));
+            assert_eq!(entries(&index)[0].pool_factor, 0);
+        }
+
+        /// Vectors pooled for a `Cosine` field (normalized) are pooled again
+        /// by a field of the same factor that does not normalize.
+        #[test]
+        fn test_vectors_pooled_for_another_metric_are_pooled_again() {
+            let config = MultiVectorIndexConfig {
+                distance_metric: DistanceMetric::DotProduct,
+                ..config(MultiVectorStorage::F32, 2)
+            };
+            let index = MultiVectorIndex::open_or_create(storage(), "index", config).unwrap();
+            commit_prepared(&index, 1, vec![prepared(1, 9, cosine(2))]);
+            let expected = token_pooling::pool(&flat(&raw(1, 9)), DIM, 2, false).unwrap();
+            assert_ne!(expected, pooled(1, 9, 2));
+            assert_eq!(vectors_of(&index, 1).unwrap(), expected);
+        }
+
+        /// Pooled vectors that were pooled from a different number of
+        /// vectors than they come with are not kept.
+        #[test]
+        fn test_vectors_pooled_from_other_vectors_are_pooled_again() {
+            let index = open(&storage(), MultiVectorStorage::F32, 2);
+            commit_prepared(
+                &index,
+                1,
+                vec![FieldVectors {
+                    pooled: cosine(2).apply(&raw(1, 9)),
+                    ..FieldVectors::new(FIELD, raw(1, 7))
+                }],
+            );
+            assert_eq!(vectors_of(&index, 1).unwrap(), pooled(1, 7, 2));
+        }
+
+        /// Several entries for one document are pooled together, whatever
+        /// the first entry was pooled to on its own.
+        #[test]
+        fn test_several_entries_pool_their_concatenation() {
+            let index = open(&storage(), MultiVectorStorage::F32, 2);
+            let all = raw(1, 9);
+            let first = FieldVectors {
+                pooled: cosine(2).apply(&all[..5]),
+                ..FieldVectors::new(FIELD, all[..5].to_vec())
+            };
+            assert!(first.pooled.is_some());
+            commit_prepared(
+                &index,
+                1,
+                vec![first, FieldVectors::new(FIELD, all[5..].to_vec())],
+            );
+            assert_eq!(vectors_of(&index, 1).unwrap(), pooled(1, 9, 2));
+        }
+
+        /// A vector of another dimension is rejected even when the document
+        /// comes with pooled vectors the writer would keep.
+        #[test]
+        fn test_vectors_of_another_dimension_are_rejected_even_when_pooled() {
+            let index = open(&storage(), MultiVectorStorage::F32, 2);
+            let mut vectors = raw(1, 7);
+            let pooled = cosine(2).apply(&vectors);
+            assert!(pooled.is_some());
+            vectors[3] = Vector::new(vec![1.0; DIM + 1]);
+            let mut writer = index.writer().unwrap();
+            let err = writer
+                .add_prepared_document_vectors(
+                    1,
+                    vec![FieldVectors {
+                        pooled,
+                        ..FieldVectors::new(FIELD, vectors)
+                    }],
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("dimension"), "{err}");
+            assert!(!writer.has_pending_changes());
         }
     }
 }

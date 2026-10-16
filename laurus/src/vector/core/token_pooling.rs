@@ -26,12 +26,102 @@
 //!
 //! Cost per document: `O(r²)` time and memory (an `f64` condensed distance
 //! matrix of `r (r - 1) / 2` entries).
+//!
+//! [`TokenPooling`] names everything the result depends on besides the
+//! rows, so a document can be pooled away from the writer that stores it
+//! (#1429): the writer keeps rows pooled elsewhere only when their
+//! [`TokenPooling`] equals its own. Documents pooled at the same time share
+//! a memory budget ([`POOLING_BUDGET_BYTES`]).
 
-use crate::vector::core::vector::normalize_slice;
+use std::num::NonZeroUsize;
+use std::ops::Range;
+use std::sync::Arc;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::vector::core::vector::{Vector, normalize_slice};
 
 /// Rows kept verbatim at the start of every document: the first token
 /// (`[CLS]` for a ColBERT model), as Sentence Transformers and PyLate do.
 pub(crate) const PROTECTED_ROWS: usize = 1;
+
+/// Memory that documents pooled at the same time may hold together, as
+/// measured by [`pooling_bytes`]: one document at the 8,192-vector maximum,
+/// which is what pooling held at most while it ran under the writer lock.
+/// A larger document is pooled alone.
+pub(crate) const POOLING_BUDGET_BYTES: usize = 256 << 20;
+
+/// Memory pooling one document of `rows` token vectors of `dimension`
+/// holds: its `f64` condensed distance matrix and an `f32` copy of its
+/// rows.
+pub(crate) fn pooling_bytes(rows: usize, dimension: usize) -> usize {
+    4 * rows * rows.saturating_sub(1) + 4 * rows * dimension
+}
+
+/// Split documents of the given pooling `costs` (see [`pooling_bytes`]),
+/// in order, into consecutive windows whose costs add up to at most
+/// `budget`, so that a window's documents can be pooled at the same time.
+/// A document that costs more than `budget` forms a window of its own.
+pub(crate) fn pool_windows(costs: &[usize], budget: usize) -> Vec<Range<usize>> {
+    let mut windows = Vec::new();
+    let (mut start, mut held) = (0, 0usize);
+    for (i, &cost) in costs.iter().enumerate() {
+        if i > start && held.saturating_add(cost) > budget {
+            windows.push(start..i);
+            (start, held) = (i, 0);
+        }
+        held = held.saturating_add(cost);
+    }
+    if start < costs.len() {
+        windows.push(start..costs.len());
+    }
+    windows
+}
+
+/// Bounds the documents pooled at the same time outside the writer
+/// (#1429): together they hold at most a budget of [`pooling_bytes`], and
+/// no more of them run at once than there are cores, however small they
+/// are. Waiters are served first come, first served.
+#[derive(Debug)]
+pub(crate) struct PoolingBudget {
+    permits: Arc<Semaphore>,
+    budget: usize,
+    min_charge: usize,
+}
+
+impl PoolingBudget {
+    /// A budget of `budget` bytes shared by at most `parallelism`
+    /// documents at once.
+    pub(crate) fn new(budget: usize, parallelism: usize) -> Self {
+        let budget = budget.clamp(1, u32::MAX as usize);
+        Self {
+            permits: Arc::new(Semaphore::new(budget)),
+            budget,
+            min_charge: budget / parallelism.max(1),
+        }
+    }
+
+    /// [`POOLING_BUDGET_BYTES`] shared by as many documents as this machine
+    /// has cores.
+    pub(crate) fn for_this_machine() -> Self {
+        Self::new(
+            POOLING_BUDGET_BYTES,
+            std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
+        )
+    }
+
+    /// Wait until a document of `rows` token vectors of `dimension` may be
+    /// pooled. It may be until the returned permit is dropped.
+    pub(crate) async fn acquire(&self, rows: usize, dimension: usize) -> OwnedSemaphorePermit {
+        let charge = pooling_bytes(rows, dimension)
+            .max(self.min_charge)
+            .min(self.budget);
+        Arc::clone(&self.permits)
+            .acquire_many_owned(charge as u32)
+            .await
+            .expect("the pooling budget's semaphore is never closed")
+    }
+}
 
 /// Clusters the `rest` rows after the protected ones are pooled into.
 fn cluster_count(rest: usize, factor: u32) -> usize {
@@ -41,7 +131,7 @@ fn cluster_count(rest: usize, factor: u32) -> usize {
 /// The number of rows a document of `rows` token vectors keeps after
 /// pooling by `factor`: a pure function of the two, so a merge can write a
 /// segment's document table before pooling the rows.
-pub(crate) fn pooled_count(rows: usize, factor: u32) -> usize {
+pub fn pooled_count(rows: usize, factor: u32) -> usize {
     let protected = rows.min(PROTECTED_ROWS);
     let rest = rows - protected;
     let clusters = cluster_count(rest, factor);
@@ -105,6 +195,145 @@ pub(crate) fn pool(
         }
     }
     Some(pooled)
+}
+
+/// How a field pools its documents' token vectors: everything the pooled
+/// rows depend on besides the rows themselves. Equal rows pooled under
+/// equal `TokenPooling`s give the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenPooling {
+    dimension: usize,
+    factor: u32,
+    normalize: bool,
+}
+
+impl TokenPooling {
+    /// Create a pooling configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `dimension` - Length of every token vector.
+    /// * `factor` - Pooling factor (see [`pooled_count`]); `<= 1` pools
+    ///   nothing.
+    /// * `normalize` - Whether the field L2-normalizes its token vectors (a
+    ///   `Cosine` field): the vectors are normalized before pooling and the
+    ///   cluster means after it.
+    pub fn new(dimension: usize, factor: u32, normalize: bool) -> Self {
+        Self {
+            dimension,
+            factor,
+            normalize,
+        }
+    }
+
+    /// Length of every token vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// The pooling factor.
+    pub fn factor(&self) -> u32 {
+        self.factor
+    }
+
+    /// Whether token vectors are L2-normalized (see [`Self::new`]).
+    pub fn normalize(&self) -> bool {
+        self.normalize
+    }
+
+    /// Pool one document's rows as the field stores them (row-major, and
+    /// already normalized when the field normalizes), as a merge does.
+    ///
+    /// # Returns
+    ///
+    /// `None` when pooling leaves the rows unchanged; otherwise the
+    /// [`pooled_count`] pooled rows.
+    pub(crate) fn pool_rows(&self, rows: &[f32]) -> Option<Vec<f32>> {
+        pool(rows, self.dimension, self.factor, self.normalize)
+    }
+
+    /// Pool one document's token vectors as they were embedded, before the
+    /// field normalizes them: normalize a copy when the field normalizes,
+    /// with the arithmetic of [`Vector::normalize`], then pool it. Ingest
+    /// pools every document through here, inside or outside the writer.
+    ///
+    /// # Returns
+    ///
+    /// `None` when pooling leaves the document unchanged (see
+    /// [`pooled_count`]) or when a vector's length is not
+    /// [`Self::dimension`], which the writer rejects; otherwise the pooled
+    /// vectors, tagged with this configuration.
+    pub fn apply(&self, vectors: &[Vector]) -> Option<PooledTokens> {
+        let n = vectors.len();
+        if self.dimension == 0
+            || pooled_count(n, self.factor) == n
+            || vectors.iter().any(|v| v.dimension() != self.dimension)
+        {
+            return None;
+        }
+        let mut rows = Vec::with_capacity(n * self.dimension);
+        for vector in vectors {
+            let start = rows.len();
+            rows.extend_from_slice(&vector.data);
+            if self.normalize {
+                normalize_slice(&mut rows[start..]);
+            }
+        }
+        let pooled = self.pool_rows(&rows)?;
+        Some(PooledTokens {
+            pooling: *self,
+            source_len: n,
+            vectors: pooled
+                .chunks_exact(self.dimension)
+                .map(|row| Vector::new(row.to_vec()))
+                .collect(),
+        })
+    }
+}
+
+/// A document's token vectors pooled by [`TokenPooling::apply`], tagged
+/// with the configuration they were pooled under and how many vectors
+/// they were pooled from. Only `apply` creates one, so the tag always
+/// describes the vectors.
+#[derive(Clone, Debug)]
+pub struct PooledTokens {
+    pooling: TokenPooling,
+    source_len: usize,
+    vectors: Vec<Vector>,
+}
+
+impl PooledTokens {
+    /// The configuration the vectors were pooled under.
+    pub fn pooling(&self) -> TokenPooling {
+        self.pooling
+    }
+
+    /// How many token vectors were pooled.
+    pub fn source_len(&self) -> usize {
+        self.source_len
+    }
+
+    /// The pooled vectors.
+    pub fn vectors(&self) -> &[Vector] {
+        &self.vectors
+    }
+
+    /// Take the pooled vectors.
+    pub fn into_vectors(self) -> Vec<Vector> {
+        self.vectors
+    }
+
+    /// `vectors`, whatever they are, tagged as pooled under `pooling` from
+    /// `source_len` vectors, so a test can tell the rows a writer kept from
+    /// rows it pooled itself.
+    #[cfg(test)]
+    pub(crate) fn tagged(pooling: TokenPooling, source_len: usize, vectors: Vec<Vector>) -> Self {
+        Self {
+            pooling,
+            source_len,
+            vectors,
+        }
+    }
 }
 
 /// Index of the pair `(i, j)`, `i < j`, in a condensed distance matrix of
@@ -368,6 +597,144 @@ mod tests {
         assert_eq!(&raw[3..], &[0.5, 0.5, 0.0]);
         let unit = pool(&input, 3, 2, true).unwrap();
         assert!((norm(&unit[3..]) - 1.0).abs() < 1e-6, "{unit:?}");
+    }
+
+    fn to_vectors(values: &[f32], dimension: usize) -> Vec<Vector> {
+        values
+            .chunks_exact(dimension)
+            .map(|row| Vector::new(row.to_vec()))
+            .collect()
+    }
+
+    fn bits(vectors: &[Vector]) -> Vec<u32> {
+        vectors
+            .iter()
+            .flat_map(|v| v.data.iter().map(|x| x.to_bits()))
+            .collect()
+    }
+
+    /// `apply` gives exactly the rows the writer stored before #1429:
+    /// normalize every vector in place, then pool the rows.
+    #[test]
+    fn test_apply_matches_normalizing_in_place_then_pooling() {
+        let dimension = 5;
+        for normalize in [true, false] {
+            let pooling = TokenPooling::new(dimension, 2, normalize);
+            let mut pooled_documents = 0;
+            for n in [1, 2, 30] {
+                let raw = to_vectors(&rows(n, dimension, n as u64 + 3), dimension);
+                let mut in_place = raw.clone();
+                if normalize {
+                    in_place.iter_mut().for_each(Vector::normalize);
+                }
+                let flat: Vec<f32> = in_place
+                    .iter()
+                    .flat_map(|v| v.data.iter().copied())
+                    .collect();
+                match (pooling.apply(&raw), pool(&flat, dimension, 2, normalize)) {
+                    (None, None) => assert_eq!(pooled_count(n, 2), n),
+                    (Some(applied), Some(expected)) => {
+                        pooled_documents += 1;
+                        assert_eq!(applied.pooling(), pooling);
+                        assert_eq!(applied.source_len(), n);
+                        assert_eq!(
+                            bits(applied.vectors()),
+                            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            "{n} rows, normalize {normalize}"
+                        );
+                        assert_eq!(bits(&applied.vectors()[..1]), bits(&in_place[..1]));
+                    }
+                    (applied, expected) => panic!(
+                        "{n} rows: apply pooled {}, the reference {}",
+                        applied.is_some(),
+                        expected.is_some()
+                    ),
+                }
+            }
+            assert_eq!(pooled_documents, 1, "normalize {normalize}");
+        }
+    }
+
+    /// A vector of another length is refused rather than pooled into rows
+    /// that straddle vectors, even when the lengths still add up to whole
+    /// rows.
+    #[test]
+    fn test_apply_refuses_vectors_of_another_dimension() {
+        let pooling = TokenPooling::new(3, 2, true);
+        let mut raw = to_vectors(&rows(9, 3, 5), 3);
+        assert!(pooling.apply(&raw).is_some());
+        raw[4] = Vector::new(vec![1.0, 0.0]);
+        raw[5] = Vector::new(vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(raw.iter().map(Vector::dimension).sum::<usize>(), 27);
+        assert!(pooling.apply(&raw).is_none());
+        assert!(TokenPooling::new(0, 2, true).apply(&[]).is_none());
+    }
+
+    #[test]
+    fn test_pool_windows_cover_the_documents_in_order_within_the_budget() {
+        // (costs, budget, each window's start and end)
+        for (costs, budget, windows) in [
+            (vec![], 6, vec![]),
+            (vec![3, 3, 3], 6, vec![(0, 2), (2, 3)]),
+            (vec![3, 3, 3], 9, vec![(0, 3)]),
+            (vec![6, 1, 5, 2], 6, vec![(0, 1), (1, 3), (3, 4)]),
+            (vec![10, 1, 1, 10], 5, vec![(0, 1), (1, 3), (3, 4)]),
+            (vec![1, 1, 1], 0, vec![(0, 1), (1, 2), (2, 3)]),
+        ] {
+            let found: Vec<(usize, usize)> = pool_windows(&costs, budget)
+                .into_iter()
+                .map(|w| (w.start, w.end))
+                .collect();
+            assert_eq!(found, windows, "{costs:?}, {budget}");
+        }
+        // Every window fits the budget unless it holds a single document,
+        // and together they cover the documents in order.
+        let costs: Vec<usize> = (0..200).map(|i| (i * 37 + 11) % 50).collect();
+        let windows = pool_windows(&costs, 120);
+        assert_eq!(windows.first().map(|w| w.start), Some(0));
+        assert_eq!(windows.last().map(|w| w.end), Some(costs.len()));
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        for window in windows {
+            assert!(window.len() == 1 || costs[window].iter().sum::<usize>() <= 120);
+        }
+    }
+
+    /// A document that takes the whole budget holds the next one back until
+    /// its permit is released.
+    #[test]
+    fn test_budget_holds_documents_back_until_permits_are_released() {
+        use tokio_test::{assert_pending, assert_ready, task};
+
+        let budget = PoolingBudget::new(1_000, 4);
+        assert!(pooling_bytes(100, 4) > 1_000);
+        let mut big = task::spawn(budget.acquire(100, 4));
+        let held = assert_ready!(big.poll());
+        let mut small = task::spawn(budget.acquire(2, 4));
+        assert_pending!(small.poll());
+        drop(held);
+        assert!(small.is_woken());
+        let _permit = assert_ready!(small.poll());
+    }
+
+    /// However small the documents, no more than the parallelism are
+    /// pooled at once.
+    #[test]
+    fn test_budget_pools_at_most_parallelism_documents_at_once() {
+        use tokio_test::{assert_pending, assert_ready, task};
+
+        let budget = PoolingBudget::new(1_000, 4);
+        assert!(pooling_bytes(2, 4) * 5 < 1_000);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut acquire = task::spawn(budget.acquire(2, 4));
+            held.push(assert_ready!(acquire.poll()));
+        }
+        let mut fifth = task::spawn(budget.acquire(2, 4));
+        assert_pending!(fifth.poll());
+        held.pop();
+        let _permit = assert_ready!(fifth.poll());
     }
 
     #[test]
