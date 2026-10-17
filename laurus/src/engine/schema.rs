@@ -237,6 +237,8 @@ impl Schema {
     ///   [`IvfOption::validate`], Issue #1479). When the index is reopened,
     ///   a persisted field that breaks one of these only logs a warning, so
     ///   it can still be repaired with `Engine::update_field`.
+    /// - An HNSW field using Product Quantization (including FastScan) has a
+    ///   distance other than `Euclidean` / `Cosine`.
     /// - A [`FieldOption::Flat`] or [`FieldOption::Ivf`] field uses a
     ///   product quantizer, which only HNSW implements (see
     ///   [`FlatOption::validate`] / [`IvfOption::validate`]). Unlike the

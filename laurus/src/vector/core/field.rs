@@ -844,8 +844,10 @@ impl HnswOption {
     /// Check that the options describe a usable HNSW field (Issues #1479,
     /// #1491).
     ///
-    /// HNSW implements every quantizer, so a product quantizer is checked
-    /// only for whether its `subvector_count` fits [`Self::dimension`].
+    /// HNSW implements every quantizer. Product Quantization (including
+    /// FastScan) additionally supports only the `Euclidean` and `Cosine`
+    /// distance metrics; its `subvector_count` must also fit
+    /// [`Self::dimension`].
     ///
     /// # Arguments
     ///
@@ -863,7 +865,32 @@ impl HnswOption {
     /// sub-vector dimension above `u16::MAX`, which the writer cannot
     /// encode with.
     pub fn validate(&self, field_name: &str) -> Result<()> {
-        reject_field(field_name, self.params_error())
+        if let Some(reason) = self.params_error() {
+            return reject_field(field_name, Some(reason));
+        }
+
+        let uses_product_quantization = match self.quantizer {
+            quantization::QuantizationMethod::ProductQuantization { .. } => true,
+            #[cfg(feature = "pq-fastscan")]
+            quantization::QuantizationMethod::ProductQuantizationFastScan { .. } => true,
+            quantization::QuantizationMethod::Scalar8Bit => false,
+            quantization::QuantizationMethod::Float16 => false,
+        };
+
+        if uses_product_quantization
+            && !matches!(
+                self.distance,
+                DistanceMetric::Euclidean | DistanceMetric::Cosine
+            )
+        {
+            return Err(LaurusError::invalid_argument(format!(
+                "field '{field_name}': quantizer {:?} does not support distance metric {:?}; \
+                 supported metrics are Euclidean and Cosine",
+                self.quantizer, self.distance
+            )));
+        }
+
+        Ok(())
     }
 
     /// The checks of [`Self::validate`].
