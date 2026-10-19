@@ -1282,10 +1282,10 @@ mod tests {
                 )
             }),
             ("addFlatField", |s, n| {
-                s.add_flat_field(n, 3, None, None, None)
+                s.add_flat_field(n, 3, None, None, None, None)
             }),
             ("addIvfField", |s, n| {
-                s.add_ivf_field(n, 3, None, None, None, None, None)
+                s.add_ivf_field(n, 3, None, None, None, None, None, None)
             }),
             ("addMultiVectorField", |s, n| {
                 s.add_multi_vector_field(n, 3, None, None, None, None)
@@ -1379,7 +1379,7 @@ mod tests {
             )
             .unwrap();
         schema
-            .add_flat_field("vec".to_string(), 2, None, None, None)
+            .add_flat_field("vec".to_string(), 2, None, None, None, None)
             .unwrap();
         if let Some(func) = callback {
             schema
