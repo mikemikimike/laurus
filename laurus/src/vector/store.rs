@@ -410,10 +410,7 @@ impl VectorStore {
     ) -> Result<()> {
         // Phase 2: Acquire lock and write pre-computed vectors (fast, sync-only).
         let mut guard = self.writer_cache.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
-        }
-        let writer = guard.as_mut().unwrap();
+        let writer = self.cached_writer(&mut guard)?;
         writer.delete_document(doc_id)?;
         // One call for the whole document, so a field the writer does not
         // know (e.g. removed concurrently by `delete_field`) rejects every
@@ -421,6 +418,42 @@ impl VectorStore {
         writer.add_prepared_document_vectors(doc_id, fields)?;
 
         Ok(())
+    }
+
+    /// Create the cached writer if there is none (Issue #1479).
+    ///
+    /// `Engine::index_internal` calls this before it deletes a document's
+    /// previous version and appends the document's WAL record. Creating the
+    /// writer is where a field the index cannot build with fails (an HNSW
+    /// `m` below 2, which a schema persisted before the field checks can
+    /// hold); failing there after the WAL append left a record that every
+    /// later open replayed into the same error. A commit may still drop
+    /// the writer before the document is written, and
+    /// [`Self::write_prepared`] then creates it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    pub(crate) async fn ensure_writer(&self) -> Result<()> {
+        let mut guard = self.writer_cache.lock().await;
+        self.cached_writer(&mut guard)?;
+        Ok(())
+    }
+
+    /// The writer cached in `slot` (the content of [`Self::writer_cache`]),
+    /// created first if there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creating the writer fails.
+    fn cached_writer<'a>(
+        &self,
+        slot: &'a mut Option<Box<dyn VectorIndexWriter>>,
+    ) -> Result<&'a mut dyn VectorIndexWriter> {
+        if slot.is_none() {
+            *slot = Some(self.index.writer()?);
+        }
+        Ok(slot.as_deref_mut().expect("the writer was created above"))
     }
 
     /// Pool, before the writer lock is taken, the token vectors of every
@@ -633,10 +666,7 @@ impl VectorStore {
         }
 
         let mut guard = self.writer_cache.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.index.writer()?);
-        }
-        let writer = guard.as_mut().unwrap();
+        let writer = self.cached_writer(&mut guard)?;
 
         writer.delete_document(doc_id)?;
 
@@ -1683,12 +1713,7 @@ impl VectorStore {
 
         // `purge` discards the field's data before re-creating it, so an
         // option the new index would reject must fail before that.
-        match new_option {
-            crate::vector::core::field::FieldOption::Flat(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::Ivf(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::MultiVector(opt) => opt.validate(name)?,
-            crate::vector::core::field::FieldOption::Hnsw(_) => {}
-        }
+        new_option.validate(name)?;
 
         let mut writer_guard = self.writer_cache.lock().await;
         let flush_result = match writer_guard.as_mut() {
@@ -2396,6 +2421,49 @@ mod tests {
                 "unexpected error: {err:?}"
             );
             assert_eq!(search_ids(&store, "a").unwrap(), vec![1], "{kind}");
+        }
+    }
+
+    /// Issue #1479 — a purge to an option whose parameters the new index
+    /// cannot work with (HNSW included, which has no quantizer rule) is
+    /// rejected before the field's data is discarded.
+    #[tokio::test]
+    async fn rebuild_rejects_unusable_parameters_before_purging() {
+        use crate::vector::core::field::{FieldOption, HnswOption};
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage, config).unwrap();
+        put_doc(&store, 1).await;
+        store.commit().await.unwrap();
+
+        let options = [
+            (
+                FieldOption::Hnsw(HnswOption::new(4).m(1)),
+                "field 'a': HNSW m must be at least 2, got 1",
+            ),
+            (
+                FieldOption::Flat(flat_option().dimension(0)),
+                "field 'a': Flat dimension must be greater than 0",
+            ),
+        ];
+        for (option, expected) in options {
+            let err = store
+                .rebuild_field("a", &option, FieldEmbedderChange::Keep, true)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, LaurusError::InvalidArgument(m) if m == expected),
+                "unexpected error: {err:?}"
+            );
+            assert_eq!(search_ids(&store, "a").unwrap(), vec![1], "{expected}");
         }
     }
 
