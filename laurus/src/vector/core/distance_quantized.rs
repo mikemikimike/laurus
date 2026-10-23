@@ -576,9 +576,9 @@ impl PqQuery {
 /// Returns the same metric scale as
 /// [`crate::vector::core::distance::DistanceMetric::distance`]
 /// (smaller = more similar). Only Cosine and Euclidean are supported
-/// for PQ; HNSW field validation rejects other metrics before the field
-/// is created. The infinity fallback protects callers that bypass that
-/// validation.
+/// for PQ; HNSW field validation rejects other metrics on field definition
+/// and warns when reopening a persisted schema. The infinity fallback
+/// protects callers that bypass those checks.
 pub fn distance_pq_adc(metric: DistanceMetric, query: &PqQuery, codes: &[u8]) -> f32 {
     debug_assert_eq!(codes.len(), query.params.m as usize);
     let m = query.params.m as usize;

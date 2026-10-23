@@ -214,8 +214,10 @@ recall test at `laurus/tests/vector_recall_test.rs`).
 | **Float16** | `Float16` | Issue #623 — IEEE 754 half precision, 2 bytes per dimension; nothing to train (see [Float16](#float16-issue-623)) | ~2x | HNSW, Flat, IVF |
 
 Product Quantization and PQ FastScan support only the `Euclidean` and
-`Cosine` distance metrics. Configure a PQ field with another metric only
-after choosing a non-PQ quantizer such as `Scalar8Bit` or `Float16`.
+`Cosine` distance metrics. Defining an HNSW field with another metric is
+rejected; reopening an older index warns and leaves the field repairable
+with `Engine::update_field`. To use another metric, choose a non-PQ
+quantizer such as `Scalar8Bit` or `Float16`.
 
 A Flat or IVF field with a quantizer its index type does not support is
 rejected when the index is created or the field is added or updated

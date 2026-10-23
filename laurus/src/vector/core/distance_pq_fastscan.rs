@@ -367,7 +367,8 @@ pub fn distance_pq_fastscan_u8_global_scalar(
 /// [`crate::vector::core::distance_quantized::distance_pq_adc`]:
 /// Euclidean returns `sqrt(L2²)`, Cosine halves and clamps to `[0, 2]`.
 /// Other metrics return `f32::INFINITY` as a defensive fallback for
-/// callers that bypass HNSW field validation.
+/// callers that bypass HNSW field validation, which rejects them on field
+/// definition and warns when reopening a persisted schema.
 #[inline]
 pub(crate) fn apply_metric(metric: DistanceMetric, l2_sq: f32) -> f32 {
     match metric {
