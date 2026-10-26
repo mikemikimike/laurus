@@ -369,6 +369,40 @@ async fn index_persisted_with_an_unsupported_pq_metric_opens_and_can_be_repaired
     assert_eq!(search_ids(&reopened).await, ["d9"]);
 }
 
+/// Issue #1458: replacing a persisted PQ field's unsupported metric with a
+/// non-PQ quantizer at the same distance reindexes and preserves its vectors.
+#[tokio::test(flavor = "multi_thread")]
+async fn index_persisted_with_an_unsupported_pq_metric_reindexes_vectors_when_repaired() {
+    let dir = TempDir::new().unwrap();
+    let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
+        .await
+        .unwrap();
+    put_four(&engine).await;
+    drop(engine);
+
+    let persisted = Schema::from_toml(
+        &schema_with(hnsw_pq_with_distance(2, DistanceMetric::DotProduct))
+            .to_toml()
+            .unwrap(),
+    )
+    .unwrap();
+    let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
+    let repaired = FieldOption::Hnsw(HnswOption::new(DIM).distance(DistanceMetric::DotProduct));
+    let outcome = engine.update_field("vec", repaired, REINDEX).await.unwrap();
+    assert_eq!(outcome.classification, FieldChangeKind::Reindex);
+    let mut found = search_ids(&engine).await;
+    found.sort();
+    assert_eq!(found, ["d0", "d1", "d2", "d3"]);
+    engine.commit().await.unwrap();
+    let repaired = engine.schema();
+    drop(engine);
+
+    let reopened = Engine::new(open_storage(&dir), repaired).await.unwrap();
+    let mut found = search_ids(&reopened).await;
+    found.sort();
+    assert_eq!(found, ["d0", "d1", "d2", "d3"]);
+}
+
 /// Issue #1491: writes to such a field that an older build accepted but
 /// never committed (its commit failed) are still in the WAL. Opening with
 /// the unusable count fails on them rather than discarding them, and

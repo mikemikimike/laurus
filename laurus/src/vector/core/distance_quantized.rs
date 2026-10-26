@@ -604,7 +604,8 @@ pub fn distance_pq_adc(metric: DistanceMetric, query: &PqQuery, codes: &[u8]) ->
             (l2_sq * 0.5).clamp(0.0, 2.0)
         }
         // Keep a defensive sentinel for callers that bypass field
-        // validation; engine-defined PQ fields reject these metrics.
+        // validation. A field persisted before Issue #1458 opens with a
+        // warning and still reaches this arm.
         _ => f32::INFINITY,
     }
 }

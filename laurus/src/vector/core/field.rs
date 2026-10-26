@@ -841,8 +841,8 @@ impl HnswOption {
         self
     }
 
-    /// Check that the options describe a usable HNSW field (Issues #1479,
-    /// #1491).
+    /// Check that the options describe a usable HNSW field (Issues #1458,
+    /// #1479 and #1491).
     ///
     /// HNSW implements every quantizer. Product Quantization (including
     /// FastScan) additionally supports only the `Euclidean` and `Cosine`
