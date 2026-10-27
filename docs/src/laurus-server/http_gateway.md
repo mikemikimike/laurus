@@ -78,6 +78,14 @@ any other value, including one that is not a string, is rejected with 400
 [Schema & Fields](../concepts/schema_and_fields.md#dynamic-schema) for the
 full semantics and the warning about silent truncation under `"dynamic"`.
 
+`schema` must be an object, `default_fields` an array of strings, and
+`analyzers` and `embedders` objects; in an analyzer, `char_filters` and
+`token_filters` must be arrays. `null` is the same as omitting one of these
+keys. Anything else, such as `"default_fields": "title"` or
+`"default_fields": [1, "title"]`, is rejected with 400 and no index is
+created (Issue #1524). A server older than this fix read such a value as
+omitted, or dropped the item that was not a string.
+
 ### Get Index Statistics
 
 ```bash
@@ -91,6 +99,8 @@ curl http://localhost:8080/v1/schema
 ```
 
 The response always includes `multi_valued` for `text`, `integer`, `float`, `boolean`, `date_time`, `geo`, `geo3d`, and `bytes` options (e.g. `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`, `"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}` or `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`); the same keys are accepted on `POST /v1/index` and `POST /v1/schema/fields`. Their boolean keys (`indexed`, `stored`, `multi_valued`, `doc_values` and `term_vectors`) must be `true` or `false`, and `null` is the same as omitting the key, which means `false` for `indexed`, `stored` and `multi_valued` and the engine default for `doc_values` and `term_vectors`. Anything else, such as `"true"` or `1`, is rejected with 400 and nothing is written, instead of being read as omitted (Issue #1511). A `text` option's `position_increment_gap` (Issue #1175) may be omitted on input — an omitted value means the engine default (`100`), not `0` — and is always present in the response. It must be an integer between `0` and `4294967295`, and `null` is the same as omitting it; anything else, such as `"0"`, `-1` or `4294967296`, is rejected with 400 instead of being read as omitted (Issue #1490). A `bytes` option has no `indexed` or `doc_values` key: a `Bytes` value is never indexed or written to DocValues regardless of `multi_valued` (Issue #1176).
+
+A field option has exactly one type key, such as `"text"` or `"hnsw"`, and its value is an object; a type key set to `null` next to another one is the same as omitting it. `{"text": 1}`, `{"text": null}` and `{"text": {}, "integer": {}}` are rejected with 400 on `POST /v1/index`, `POST /v1/schema/fields` and `PATCH /v1/schema/fields/{name}`, and nothing is written (Issue #1524). A server older than this fix read `{"text": 1}` as a `text` field that is neither indexed nor stored, and used the first of two type keys. A `text` option's `analyzer` is a name or an object such as `{"language": "japanese", "dict": "...", "mode": "normal"}`, whose `mode` and `user_dict` must be strings; `null` is the same as omitting `analyzer`, `mode` or `user_dict`. A server older than this fix rejected `"analyzer": null` with 400.
 
 A multi-vector field (Issue #1177) is declared as `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` (`distance` is `"cosine"` or `"dot_product"`, defaulting to `"cosine"`). Its value in a document is an array of equal-length numeric arrays, one per token vector (`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`). The field holds token vectors for late-interaction rescoring: it is not a vector-search target and is not returned with documents.
 
@@ -158,6 +168,8 @@ curl -X POST http://localhost:8080/v1/index \
 
 An `hnsw` field may also set `default_ef_search`, the size of the candidate list a search of the field uses when the request does not set `vector_params.ef_search` (Issue #644; see [Schema and Fields → `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-the-search-time-recall-knob)). Like `m`, it must be an integer between `0` and `4294967295`, and anything else, such as `"64"`, `64.0` or `-1`, is rejected with 400 and nothing is written (Issue #1490). Omitting it or setting it to `null` leaves it unset, and the response shows it only when it is set. A server older than this fix read such a value as unset, wrapped one above `4294967295` (`4294967360` became `64`), and left `default_ef_search` out of the schema in its responses. Because `PATCH /v1/schema/fields/{name}` replaces the whole option, a field copied from such a response into a PATCH loses its `default_ef_search` unless the copy sets it again.
 
+A vector field's `base_weight` must be a number, and its `embedder` (and an `hnsw` field's `pq_codebook_path`) a string. `null` is the same as omitting the key. Anything else, such as `"base_weight": "2"`, is rejected with 400 and nothing is written (Issue #1524); a server older than this fix read it as omitted, so `"base_weight": "2"` gave the engine default `1.0`.
+
 ### Add a Field (Dynamic Schema)
 
 Adds a new field to the running index. The request body uses the same `FieldOption` JSON shape as `POST /v1/index`:
@@ -181,7 +193,7 @@ Removes a field from the schema. The field name is supplied in the path:
 curl -X DELETE http://localhost:8080/v1/schema/fields/category
 ```
 
-Existing indexed data for the field remains in storage but becomes inaccessible. Per-field analyzers and embedders are unregistered.
+Existing indexed data for the field remains in storage but becomes inaccessible. Per-field analyzers and embedders are unregistered. Adding a vector field with the same name later starts it empty (see [Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 ### Change a Field
 
@@ -279,10 +291,11 @@ already-applied entries are not rolled back (they become durable at the next
 commit), and the error names the failing position, so retrying the batch or
 its suffix is idempotent.
 
-A write that fails after its write-ahead-log record was written (an I/O
-error, a full disk) stops writes instead: every later write, commit and field
-change returns `412 Precondition Failed` until the server is restarted, which
-replays the log and applies that write (see
+A write that fails at or after its write-ahead-log append (an I/O error, a
+full disk) stops writes instead: every later write, commit and field change
+returns `412 Precondition Failed` until the server is restarted, which
+replays the log and applies that write whole if its record reached the log in
+full, or leaves it unapplied, never half applied (see
 [Failed Writes](../laurus/persistence.md#failed-writes)). A request that is
 cancelled, or whose client disconnects, does not stop writes: each of its
 documents is either applied in full or not written at all, and the ones
@@ -337,7 +350,42 @@ omitting it, `null` and `0` mean no timeout. Anything else, such as `"500"`,
 without a timeout (Issue #1490). Its `parallel` must be `true` or `false`;
 omitting it and `null` mean `false`. Anything else, such as `"true"` or `1`,
 is rejected with `400 Bad Request` instead of being read as `false`
-(Issue #1511).
+(Issue #1511). Its `min_score` must be a number; omitting it and `null`
+mean `0.0`, no threshold. Lexical scores are never negative, so a negative
+`min_score` is the same as `0.0`. The gateway converts it to a 32-bit float,
+so a number beyond about `3.4e38`, such as `1e39`, becomes infinite and is
+rejected with `400 Bad Request`, also in a request without a `query`
+(Issue #1540); a server older than this fix returned no hits.
+
+The body must be a JSON object and `query` a string; omitting `query` or
+setting it to `null` means no query. Anything else is rejected with
+`400 Bad Request` (Issue #1524). A server older than this fix read a `query`
+that is not a string as no query, so `"query": 5` with `query_vectors` ran a
+vector-only search.
+
+#### Search Sorted by a Field
+
+`lexical_params.sort_by` sorts the hits by a field's value instead of by
+score:
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:rust",
+    "limit": 10,
+    "lexical_params": {"sort_by": {"field": "year", "order": "desc"}}
+  }'
+```
+
+`field` must be a string; an empty string sorts by score. `order` is
+`"asc"` or `"desc"`, matched case-insensitively, and omitting it or setting
+it to `null` means `"asc"`. These are not the gRPC names such as
+`"SORT_ORDER_DESC"`. A `sort_by` that is not an object or has no string
+`field`, and any other `order`, are rejected with `400 Bad Request`
+(Issues #1476, #1524). A server older than this fix sorted ascending for any
+other `order`, such as `"DESC"`, and sorted by score when `sort_by` had no
+string `field`. `sort_by` applies only to a request with a `query`.
 
 #### Search with Field Boosts
 
@@ -353,7 +401,19 @@ curl -X POST http://localhost:8080/v1/search \
 
 Each key must name a lexical field of the schema (or `_id`). An unknown
 field, such as a typo, or a vector field is rejected with `400 Bad Request`
-instead of being silently ignored (Issue #1374).
+instead of being silently ignored (Issue #1374). `field_boosts` must be an
+object and each boost a number; a `null` boost is the same as leaving the
+field out. Anything else, such as `{"title": "2"}`, is rejected with
+`400 Bad Request` instead of being dropped (Issue #1524).
+
+A boost multiplies the field's scores, so it must be at least `0`; `0` keeps
+a match with a lexical score of `0`. The gateway converts each boost to a
+32-bit float, so a number beyond about `3.4e38` becomes infinite. A negative
+boost (`-0` included) or an infinite one is rejected with `400 Bad Request`
+(Issue #1540). Both the field and the boost are checked in a request without
+a `query` too. A server older than this fix hid the hits of a negative boost,
+returned a `null` score for a boost such as `1e39`, and ignored `field_boosts`
+in a request without a `query`.
 
 #### Hybrid Search
 
@@ -374,6 +434,23 @@ only lexical clauses becomes a hybrid search, with or without
 non-empty numeric `vector`; `weight` (a number) and `fields` (an array of
 strings) are optional, and `null` keeps their defaults. Any other shape is
 rejected with `400 Bad Request` instead of being dropped.
+
+`fusion` takes exactly one of `rrf` (`{"k": 60}`) and `weighted_sum`
+(`{"lexical_weight": 0.5, "vector_weight": 0.5}`), each an object whose
+numbers default to the values shown when omitted or `null`. Omitting
+`fusion` uses RRF with `k` 60. A `fusion` with neither or both, or with a
+value of the wrong type such as `{"rrf": {"k": "1"}}`, is rejected with
+`400 Bad Request` (Issue #1524). A server older than this fix used the
+default instead, and `rrf` when both were set.
+
+`k` must be at least `0`: each result list adds `1 / (k + rank)`, `rank`
+starting at 1. Each weight must be between `0` and `1`, with at least one
+greater than `0`; the gateway converts the weights to 32-bit floats, so a
+positive weight too small for one, such as `1e-50`, becomes `0`. Any other
+value is rejected with `400 Bad Request`, even in a request with no hybrid
+part (Issue #1540).
+A server older than this fix clamped the weights into `[0, 1]` and returned
+`null` scores for a `k` such as `-1`.
 
 #### Search with Vector Parameters
 
@@ -435,6 +512,14 @@ the default. Anything else, such as `"true"` or `1`, is rejected with
 `400 Bad Request` instead of falling back to the default, even when `fields`
 is empty (Issue #1511).
 
+The shorthand must hold only strings, and in the object form `fields` must
+be an array of strings and `tag` and `css_class` strings; `null` is the same
+as omitting the key. A `highlight` that is neither an array nor an object,
+or one of these keys with the wrong type, is rejected with
+`400 Bad Request` instead of being dropped (Issue #1524). An empty field
+list (`[]`, `{}` or `{"fields": []}`) requests no highlighting, while the
+gRPC API rejects an empty `HighlightParams.fields`.
+
 Each result gains a `"highlights"` object, present only when at least one
 field actually highlighted:
 
@@ -472,12 +557,13 @@ curl -X POST http://localhost:8080/v1/search \
 "rescore": {"late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
 ```
 
-A rescored result's `score` is its late-interaction (MaxSim) score. Unlike
-the other search options, a malformed `rescore` (missing `field`, both or
-neither of `vectors` and `text`, unequal vector lengths) is rejected with
-400 instead of being ignored; so are the values the engine rejects (see
+A rescored result's `score` is its late-interaction (MaxSim) score. A
+malformed `rescore` (missing `field`, both or neither of `vectors` and
+`text`, unequal vector lengths) is rejected with 400 instead of being
+ignored; so are the values the engine rejects (see
 [gRPC `RescoreParams`](grpc_api.md#rescoreparams) and
 [Late-Interaction Rescore](../concepts/search/vector_search.md#late-interaction-rescore)).
+`null` for `vectors` or `text` is the same as omitting it (Issue #1524).
 
 #### Search with Grouping
 
@@ -608,4 +694,4 @@ See [Query DSL → 3D Geographic Queries](../concepts/query_dsl.md#3d-geographic
 
 All request and response bodies use JSON. The JSON structure mirrors the gRPC protobuf messages. See [gRPC API Reference](grpc_api.md) for the full message definitions.
 
-A key that takes a boolean accepts only `true`, `false` and `null`, which is the same as omitting the key. Anything else, such as the string `"true"` or the number `1`, is rejected with `400 Bad Request`, and nothing is written or searched (Issue #1511).
+Each key takes the JSON types the sections above describe (most take one; `highlight`, for example, takes an array or an object), and for a key that may be omitted, `null` is the same as omitting it. A value of another type is rejected with `400 Bad Request` whose message names the key, and nothing is written or searched: the string `"true"` or the number `1` for a boolean (Issue #1511), and the string `"2"` for a number, the number `1` for a string, or a string or an array for an object (Issue #1524). A server older than these fixes read such a value as omitted, or dropped it. The parameters of an analyzer's char filters, tokenizer and token filters are not checked this way yet (Issue #1478). In `POST /v1/search/batch`, the message starts with the position of the query that failed, such as `queries[1]: query must be a string`, and none of the queries is run.

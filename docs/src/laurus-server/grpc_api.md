@@ -137,7 +137,7 @@ The `embedder` field in vector options specifies the name of an embedder defined
 
 **Default `ef_search`:** `default_ef_search` on `HnswOption` (field `8`, `optional uint32`, Issue #644) is the size of the candidate list a search of the field uses when the request does not set `VectorParams.ef_search`. Unset leaves the choice to the engine; see [Schema and Fields → `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-the-search-time-recall-knob). `GetSchema` returns it when it is set. The HTTP gateway takes it as a JSON integer between `0` and `4294967295`, rejects anything else with 400, and shows it in its schema responses when it is set; a gateway older than Issue #1490 read a malformed value as unset and left the key out of those responses (see [HTTP Gateway](http_gateway.md)).
 
-**Product quantization `subvector_count`:** with `PRODUCT_QUANTIZATION` or `PRODUCT_QUANTIZATION_FASTSCAN`, `CreateIndex`, `AddField` and `UpdateField` reject a `subvector_count` of `0` (what a client that leaves it unset sends), one that does not divide `dimension`, and one where `subvector_count` or `dimension / subvector_count` is above `65535`, as `INVALID_ARGUMENT` (Issue #1491). A server older than this check accepts such a field and fails a later commit as `INTERNAL`: a count that does not divide `dimension` at the first commit that holds a vector of the field, and `0` once a segment of the field reaches 256 vectors (16 for FastScan); every later commit then fails as well. An index such a server created still opens, with a warning in the server log, and every document write to it fails, without being applied, until the field is repaired with `UpdateField` and a valid `subvector_count` (with `reindex`, which rebuilds the field from its segments). Repair it before deleting many of the field's documents: a compaction of the field fails the commit until then. If the index does not open because a commit failed on it, set a valid `subvector_count` in the index's `schema.toml` and start the server again.
+**Product quantization `subvector_count`:** with `PRODUCT_QUANTIZATION` or `PRODUCT_QUANTIZATION_FASTSCAN`, `CreateIndex`, `AddField` and `UpdateField` reject a `subvector_count` of `0` (what a client that leaves it unset sends), one that does not divide `dimension`, and one where `subvector_count` or `dimension / subvector_count` is above `65535`, as `INVALID_ARGUMENT` (Issue #1491). A server older than this check accepts such a field and fails a later commit as `INTERNAL`: a count that does not divide `dimension` at the first commit that holds a vector of the field, and `0` once a segment of the field reaches 256 vectors (16 for FastScan); every later commit then fails as well. An index such a server created still opens, with a warning in the server log, and every document write to it fails, without being applied, until the field is repaired with `UpdateField` and a valid `subvector_count` (with `reindex`, which rebuilds the field from its segments). Until it is repaired, a compaction of the field (which deleting many of its documents triggers) fails on every commit: the commit still succeeds and logs the failure as a warning that names the field (Issue #1500), and the deleted vectors stay in the field, hidden from searches. If the index does not open because a commit failed on it, set a valid `subvector_count` in the index's `schema.toml` and start the server again.
 
 **Product quantization distance:** `PRODUCT_QUANTIZATION` and `PRODUCT_QUANTIZATION_FASTSCAN` support only `Euclidean` and `Cosine` (Issue #1458). `CreateIndex`, `AddField` and `UpdateField` reject other distances as `INVALID_ARGUMENT`. An existing index with an unsupported distance still opens with a warning; repair it with `UpdateField`, a non-PQ quantizer and the same distance to reindex and preserve its vectors. Changing the distance discards them.
 
@@ -223,7 +223,9 @@ rpc DeleteField(DeleteFieldRequest) returns (DeleteFieldResponse);
 | `schema` | `Schema` | The updated schema after removal |
 
 Existing indexed data for the field remains in storage but becomes
-inaccessible. Per-field analyzers and embedders are unregistered.
+inaccessible. Per-field analyzers and embedders are unregistered. Adding a
+vector field with the same name later starts it empty (see
+[Removing a Field](../concepts/schema_and_fields.md#removing-a-field)).
 
 **HTTP gateway:** `DELETE /v1/schema/fields/{name}`
 
@@ -474,10 +476,10 @@ next best hits in `inner_hits`.
 | `query_vectors` | `repeated QueryVector` | No | Pre-embedded query vectors. Sent with `query`, they are added to its vector part; a `query` with only lexical clauses becomes a hybrid search (Issue #1366) |
 | `limit` | `uint32` | No | Maximum number of results (`0` means the engine default, 10). `offset + limit` must not exceed the server's [`max_result_window`](configuration.md) (default 10,000), or the search is rejected with `INVALID_ARGUMENT` (Issue #1367) |
 | `offset` | `uint32` | No | Number of results to skip; counts toward `max_result_window` with `limit` |
-| `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search |
+| `fusion` | `FusionAlgorithm` | No | Fusion algorithm for hybrid search. Unset uses RRF with `k` 60. An out-of-range parameter (see [FusionAlgorithm](#fusionalgorithm)) is rejected with `INVALID_ARGUMENT`, even when the request has no hybrid part (Issue #1540) |
 | `lexical_params` | `LexicalParams` | No | Lexical search parameters |
 | `vector_params` | `VectorParams` | No | Vector search parameters |
-| `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect |
+| `field_boosts` | `map<string, float>` | No | Per-field score boosting for the lexical part. A key must name a lexical field of the schema (or `_id`); an unknown or vector field is rejected with `INVALID_ARGUMENT` (Issue #1374). A lexical field the query does not use is accepted and has no effect. Each boost multiplies the field's scores and must be finite and at least `0` (`-0` is rejected); `0` keeps a match with a lexical score of `0`. Any other boost is rejected with `INVALID_ARGUMENT`. Both the field and the boost are checked on a request without a `query` too (Issue #1540) |
 | `highlight` | `HighlightParams` | No | Request highlighted fragments per field (Issue #1134) |
 | `rescore` | `RescoreParams` | No | Rescore the top first-stage results with late interaction (Issue #1351) |
 | `group_by` | `GroupByParams` | No | Group the results by a field's value; `limit` and `offset` then count groups (Issue #1297) |
@@ -506,14 +508,16 @@ At least one of `query` or `query_vectors` must be provided.
 
 A `oneof` with two options:
 
-- **RRF** (Reciprocal Rank Fusion): `k` parameter (default: 60)
-- **WeightedSum**: `lexical_weight` and `vector_weight`
+- **RRF** (Reciprocal Rank Fusion): each result list adds `1 / (k + rank)`, `rank` starting at 1. `k` must be finite and at least `0`. proto3 sends an unset `k` as `0`, not 60: set it explicitly (60 is the usual value), or leave `fusion` unset for `k` 60.
+- **WeightedSum**: the min-max normalized lexical and vector scores, multiplied by `lexical_weight` and `vector_weight` and added. Each weight must be in `[0, 1]`, and at least one greater than `0`. An unset weight is `0`, so an empty `WeightedSum` is rejected.
+
+Any other value is rejected with `INVALID_ARGUMENT` (Issue #1540); weights used to be clamped to `[0, 1]`.
 
 ### LexicalParams
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `min_score` | `float` | Minimum score threshold |
+| `min_score` | `float` | Minimum lexical score. `0` (unset) means no threshold; lexical scores are never negative, so a negative value is the same. A non-finite value is rejected with `INVALID_ARGUMENT`, also on a request without a `query` (Issue #1540) |
 | `timeout_ms` | `optional uint64` | Search timeout in milliseconds. Unset or `0` means no timeout |
 | `parallel` | `bool` | Enable parallel search |
 | `sort_by` | `SortSpec` | Sort by a field instead of score |
@@ -523,7 +527,7 @@ A `oneof` with two options:
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `field` | `string` | Field name to sort by. Empty string means sort by relevance score |
-| `order` | `SortOrder` | `SORT_ORDER_ASC` (ascending) or `SORT_ORDER_DESC` (descending) |
+| `order` | `SortOrder` | `SORT_ORDER_ASC` (ascending) or `SORT_ORDER_DESC` (descending). Any other value is rejected with `INVALID_ARGUMENT`, even when `sort_by` has no effect (no `query`, or an empty `field`); an older server sorted ascending (Issue #1476) |
 
 ### VectorParams
 
@@ -732,7 +736,7 @@ gRPC errors are returned as standard `Status` codes:
 | :--- | :--- | :--- |
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | Malformed request or schema, unknown field in a query, a search whose `offset + limit` exceeds `max_result_window` |
 | No index open | `FAILED_PRECONDITION` | RPC called before `CreateIndex` |
-| Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed past its write-ahead-log append; restart the server to replay the log, which applies that write (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
+| Writes stopped | `FAILED_PRECONDITION` | A write, commit or field change after an earlier write failed at or after its write-ahead-log append; restart the server to replay the log, which applies that write whole if its record reached the log in full, and otherwise not at all (see [Failed Writes](../laurus/persistence.md#failed-writes)). A write whose call is cancelled, whose deadline expires or whose client disconnects does not stop writes: each of its documents is either applied in full or not written at all |
 | Index already exists | `ALREADY_EXISTS` | `CreateIndex` called twice |
 | Not implemented | `UNIMPLEMENTED` | Feature not yet supported |
 | Internal errors | `INTERNAL` | I/O, storage, or unexpected errors |

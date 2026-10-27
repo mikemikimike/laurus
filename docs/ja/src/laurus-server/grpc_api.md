@@ -137,7 +137,7 @@ message AnalyzerDefinition {
 
 **`ef_search` のデフォルト:** `HnswOption` の `default_ef_search`（フィールド番号 `8`、`optional uint32`、Issue #644）は、リクエストが `VectorParams.ef_search` を指定しないときに、そのフィールドの検索で使う候補リストの大きさです。未設定のときはエンジンが決めます。[スキーマとフィールドの `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ) を参照してください。`GetSchema` は、設定されているときに返します。HTTP gateway は `0` から `4294967295` までの JSON の整数として受け取ってそれ以外を 400 で拒否し、設定されているときはスキーマのレスポンスに出します。Issue #1490 より古い gateway は、不正な値を未設定として読み、そのレスポンスにキーを出しませんでした（[HTTP Gateway](http_gateway.md) を参照）。
 
-**直積量子化の `subvector_count`:** `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` のとき、`CreateIndex`・`AddField`・`UpdateField` は、`0` の `subvector_count`（クライアントが省略したときに送られる値）、`dimension` を割り切らない値、`subvector_count` か `dimension / subvector_count` が `65535` を超える値を `INVALID_ARGUMENT` で拒否します（Issue #1491）。この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が `INTERNAL` で失敗します。`dimension` を割り切らない値では、そのフィールドのベクトルを含む最初の commit で、`0` では、フィールドのセグメントが 256 件（FastScan は 16 件）に達した時点で失敗し、以後の commit もすべて失敗します。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出て、フィールドを直すまではすべてのドキュメントの書き込みが、適用されずに失敗します。フィールドは `UpdateField` で有効な `subvector_count` を指定して直します（`reindex` が要り、フィールドはそのセグメントから作り直されます）。フィールドのドキュメントを多く削除する前に直してください。直すまでは、フィールドの compaction が commit を失敗させます。commit が失敗したためにインデックスが開けない場合は、インデックスの `schema.toml` に有効な `subvector_count` を書いてサーバーを起動し直してください。
+**直積量子化の `subvector_count`:** `PRODUCT_QUANTIZATION` か `PRODUCT_QUANTIZATION_FASTSCAN` のとき、`CreateIndex`・`AddField`・`UpdateField` は、`0` の `subvector_count`（クライアントが省略したときに送られる値）、`dimension` を割り切らない値、`subvector_count` か `dimension / subvector_count` が `65535` を超える値を `INVALID_ARGUMENT` で拒否します（Issue #1491）。この検査より古いサーバーはそうしたフィールドを受け付け、後の commit が `INTERNAL` で失敗します。`dimension` を割り切らない値では、そのフィールドのベクトルを含む最初の commit で、`0` では、フィールドのセグメントが 256 件（FastScan は 16 件）に達した時点で失敗し、以後の commit もすべて失敗します。そうしたサーバーが作ったインデックスも開けますが、サーバーのログに警告が出て、フィールドを直すまではすべてのドキュメントの書き込みが、適用されずに失敗します。フィールドは `UpdateField` で有効な `subvector_count` を指定して直します（`reindex` が要り、フィールドはそのセグメントから作り直されます）。直すまでは、フィールドの compaction（フィールドのドキュメントを多く削除すると起きる）が commit のたびに失敗します。commit 自体は成功し、失敗をフィールド名付きの警告としてログに出します（Issue #1500）。削除したベクトルは、検索から隠されたままフィールドに残ります。commit が失敗したためにインデックスが開けない場合は、インデックスの `schema.toml` に有効な `subvector_count` を書いてサーバーを起動し直してください。
 
 **直積量子化の距離:** `PRODUCT_QUANTIZATION` と `PRODUCT_QUANTIZATION_FASTSCAN` が対応する距離は `Euclidean` と `Cosine` のみです（Issue #1458）。それ以外の距離は `CreateIndex`・`AddField`・`UpdateField` で `INVALID_ARGUMENT` として拒否されます。既存インデックスは警告付きで開けます。ベクトルを保って再 index するには、同じ距離の非 PQ quantizer で `UpdateField` してください。距離を変更するとベクトルは破棄されます。
 
@@ -218,7 +218,7 @@ rpc AddField(AddFieldRequest) returns (AddFieldResponse);
 
 ### `DeleteField`
 
-稼働中のインデックスからフィールドを動的に削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。
+稼働中のインデックスからフィールドを動的に削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。あとで同じ名前のベクトルフィールドを追加すると、空の状態から始まります（[フィールドの削除](../concepts/schema_and_fields.md#フィールドの削除)を参照）。
 
 ```protobuf
 rpc DeleteField(DeleteFieldRequest) returns (DeleteFieldResponse);
@@ -471,10 +471,10 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | `query_vectors` | `repeated QueryVector` | いいえ | 埋め込み済みのクエリベクトル。`query` と一緒に送ると、そのベクトル部分に追加される。lexical 句だけの `query` はハイブリッド検索になる（Issue #1366） |
 | `limit` | `uint32` | いいえ | 最大結果件数（`0` はエンジンの既定値 10）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索は `INVALID_ARGUMENT` で拒否される（Issue #1367） |
 | `offset` | `uint32` | いいえ | スキップする結果件数。`limit` と合わせて `max_result_window` の対象になる |
-| `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム |
+| `fusion` | `FusionAlgorithm` | いいえ | ハイブリッド検索の Fusion アルゴリズム。未指定なら `k` 60 の RRF。範囲外のパラメータ（[FusionAlgorithm](#fusionalgorithm) を参照）は、ハイブリッド部分のない要求でも `INVALID_ARGUMENT` で拒否される（Issue #1540） |
 | `lexical_params` | `LexicalParams` | いいえ | Lexical 検索パラメータ |
 | `vector_params` | `VectorParams` | いいえ | ベクトル検索パラメータ |
-| `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い |
+| `field_boosts` | `map<string, float>` | いいえ | lexical 部分のフィールドごとのスコアブースト。キーはスキーマの lexical フィールド（または `_id`）でなければならず、未知のフィールドやベクトルフィールドは `INVALID_ARGUMENT` で拒否される（Issue #1374）。クエリで使っていない lexical フィールドは受け付けられ、効果は無い。各ブーストはそのフィールドのスコアに掛かり、有限で `0` 以上でなければならない（`-0` は拒否される）。`0` では一致した文書が lexical スコア `0` で残る。それ以外のブーストは `INVALID_ARGUMENT` で拒否される。フィールドとブーストは、`query` のない要求でも検査される（Issue #1540） |
 | `highlight` | `HighlightParams` | いいえ | フィールドごとのハイライト済みフラグメントを要求する（Issue #1134） |
 | `rescore` | `RescoreParams` | いいえ | 1 段目の上位の結果を late interaction で再採点する（Issue #1351） |
 | `group_by` | `GroupByParams` | いいえ | 結果をフィールド値でグループ化する。指定すると `limit` と `offset` はグループの数を数える（Issue #1297） |
@@ -503,14 +503,16 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 
 以下の 2 つのオプションを持つ `oneof` です。
 
-- **RRF** (Reciprocal Rank Fusion): `k` パラメータ（デフォルト: 60）
-- **WeightedSum**: `lexical_weight` と `vector_weight`
+- **RRF** (Reciprocal Rank Fusion): 各結果リストが `1 / (k + rank)` を足します（`rank` は 1 始まり）。`k` は有限で `0` 以上でなければなりません。proto3 は未設定の `k` を 60 ではなく `0` として送ります。明示的に指定する（通常は 60）か、`fusion` を未設定にして `k` 60 を使ってください。
+- **WeightedSum**: min-max 正規化した lexical スコアとベクトルスコアに、それぞれ `lexical_weight` と `vector_weight` を掛けて足します。各重みは `[0, 1]` の範囲で、少なくとも一方が `0` より大きくなければなりません。未設定の重みは `0` なので、空の `WeightedSum` は拒否されます。
+
+それ以外の値は `INVALID_ARGUMENT` で拒否されます（Issue #1540）。以前は重みを `[0, 1]` に丸めていました。
 
 ### LexicalParams
 
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
-| `min_score` | `float` | 最小スコア閾値 |
+| `min_score` | `float` | lexical スコアの下限。`0`（未設定）は閾値なし。lexical スコアは負にならないので、負の値も同じ。非有限値は、`query` のない要求でも `INVALID_ARGUMENT` で拒否される（Issue #1540） |
 | `timeout_ms` | `optional uint64` | 検索タイムアウト（ミリ秒）。未設定または `0` はタイムアウトなし |
 | `parallel` | `bool` | 並列検索を有効化 |
 | `sort_by` | `SortSpec` | スコアの代わりにフィールドでソート |
@@ -520,7 +522,7 @@ rpc SearchStream(SearchRequest) returns (stream SearchResult);
 | フィールド | 型 | 説明 |
 | :--- | :--- | :--- |
 | `field` | `string` | ソート対象のフィールド名。空文字列はスコアでソートすることを意味する |
-| `order` | `SortOrder` | `SORT_ORDER_ASC`（昇順）または `SORT_ORDER_DESC`（降順） |
+| `order` | `SortOrder` | `SORT_ORDER_ASC`（昇順）または `SORT_ORDER_DESC`（降順）。ほかの値は、`sort_by` が効かないとき（`query` がない、または `field` が空）も `INVALID_ARGUMENT` で拒否されます。古いサーバーは昇順に並べていました（Issue #1476） |
 
 ### VectorParams
 
@@ -716,7 +718,7 @@ gRPC エラーは標準の `Status` コードとして返されます。
 | :--- | :--- | :--- |
 | Schema / Query / Field / Invalid argument / JSON | `INVALID_ARGUMENT` | 不正なリクエストまたはスキーマ、クエリ内の不明なフィールド、`offset + limit` が `max_result_window` を超える検索 |
 | インデックス未オープン | `FAILED_PRECONDITION` | `CreateIndex` の前に RPC が呼び出された場合 |
-| 書き込みの停止 | `FAILED_PRECONDITION` | それ以前の書き込みが write-ahead log への追記の後に失敗した後の、書き込み・コミット・フィールド変更。サーバーを再起動するとログが再生され、その書き込みが適用されます（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照）。呼び出しがキャンセルされても、期限が切れても、クライアントが切断しても、書き込みは止まりません。その呼び出しの各ドキュメントは、すべて適用されているか、まったく書かれていないかのどちらかです |
+| 書き込みの停止 | `FAILED_PRECONDITION` | それ以前の書き込みが write-ahead log への追記以降に失敗した後の、書き込み・コミット・フィールド変更。サーバーを再起動するとログが再生され、レコードがログに完全に届いていればその書き込みが丸ごと適用され、届いていなければ適用されません（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照）。呼び出しがキャンセルされても、期限が切れても、クライアントが切断しても、書き込みは止まりません。その呼び出しの各ドキュメントは、すべて適用されているか、まったく書かれていないかのどちらかです |
 | インデックスが既に存在 | `ALREADY_EXISTS` | `CreateIndex` が 2 回呼び出された場合 |
 | 未実装 | `UNIMPLEMENTED` | まだサポートされていない機能 |
 | 内部エラー | `INTERNAL` | I/O、ストレージ、または予期しないエラー |

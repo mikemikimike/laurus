@@ -104,6 +104,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Uses interior mutability for thread-safe access.
     fn optimize(&self) -> Result<()>;
 
+    /// [`Self::optimize`], telling a failure before its merge published
+    /// apart from one after it (Issue #1538).
+    ///
+    /// [`Self::rebuild_field`] optimizes a new index opened over a field's
+    /// files. Once the merge has published, only that index can read the
+    /// field, so the caller must keep it even if a later step fails.
+    ///
+    /// The default reports every [`Self::optimize`] error as one before the
+    /// publish. The segmented indexes and the MultiVector index, whose
+    /// optimize forgets the reclaimed deletions after the merge published,
+    /// override it.
+    ///
+    /// # Returns
+    ///
+    /// `None` when every step succeeded, or the error of a step after the
+    /// merge published. The index is usable either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the optimization failed before it published
+    /// anything.
+    fn optimize_until_published(&self) -> Result<Option<LaurusError>> {
+        self.optimize().map(|()| None)
+    }
+
     /// Refresh the index metadata from storage.
     ///
     /// Should be called after external writes (e.g., by a Writer) to ensure
@@ -204,12 +229,32 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Persist any pending logical deletions to storage (Issue #624).
     ///
     /// Called by the store on commit so the deletion bitmap survives restarts.
-    /// Defaults to a no-op for indexes that do not buffer soft deletions.
+    /// The segmented indexes then also publish the pending WAL checkpoint
+    /// recorded by [`Self::set_last_wal_seq`], so this is the last vector step
+    /// of the commit ladder. Defaults to a no-op for indexes that do not
+    /// buffer soft deletions.
     ///
     /// # Errors
     ///
     /// Returns an error if writing the deletion bitmap to storage fails.
     fn persist_deletions(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Write the logical deletions to storage without publishing a WAL
+    /// checkpoint (Issue #1527).
+    ///
+    /// For a caller that opens another index over the same files, which reads
+    /// the deletions from storage only: [`Self::rebuild_field`] calls it on a
+    /// field's index before it reopens the field. Unlike
+    /// [`Self::persist_deletions`], the checkpoint stays where the last commit
+    /// published it, so recovery still replays every record since. Indexes
+    /// that buffer soft deletions must override it; the default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the deletion bitmap to storage fails.
+    fn write_deletions(&self) -> Result<()> {
         Ok(())
     }
 
@@ -224,7 +269,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error if the triggered compaction fails.
+    /// Returns an error if the triggered compaction fails. The store logs it
+    /// as a warning without failing the commit, whose changes are durable by
+    /// then, and calls this again on its next commit (Issue #1500).
     fn maybe_auto_compact(&self) -> Result<bool> {
         Ok(false)
     }
@@ -244,10 +291,18 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Add a new vector field to this index (Issue #948: dynamic schema
     /// evolution).
     ///
+    /// The field starts empty, also under the name of a field that
+    /// [`Self::remove_field`] removed without a purge (Issue #1535): the
+    /// implementation discards the files that field left. They stopped
+    /// receiving deletes when it was removed, and may have been written
+    /// under another configuration.
+    ///
     /// # Errors
     ///
     /// The default implementation always errors; callers must gate on
-    /// [`Self::supports_dynamic_fields`] first.
+    /// [`Self::supports_dynamic_fields`] first. Implementations also error if
+    /// a field named `name` is registered, if `name` cannot have storage of
+    /// its own, or if discarding the old files or creating the field fails.
     fn add_field(&self, _name: &str, _config: VectorIndexTypeConfig) -> Result<()> {
         Err(LaurusError::InvalidOperation(
             "this index type does not support adding fields dynamically".to_string(),
@@ -257,15 +312,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// Remove a vector field from this index's routing (Issue #948: dynamic
     /// schema evolution).
     ///
-    /// With `purge: false`, this only unregisters the field -- mirrors
-    /// [`crate::vector::store::VectorStore`]'s existing "unregister only"
-    /// contract for `delete_field`, so the data can be recovered by
-    /// re-adding the field with the same name.
+    /// With `purge: false`, this only unregisters the field, as
+    /// [`crate::vector::store::VectorStore::delete_field`] does. Its files
+    /// stay until [`Self::add_field`] adds a field with the same name, which
+    /// discards them and starts empty (Issue #1535): the data is not
+    /// recovered.
     ///
     /// With `purge: true` (Issue #1080: `Engine::update_field` rebuilding a
     /// field under a new type), the field's on-disk data is also
-    /// physically deleted, so a same-name re-add under a different type
-    /// cannot misread the old bytes.
+    /// physically deleted right away.
     ///
     /// Defaults to `Ok(())` (a no-op): index types without field boundaries
     /// have nothing to unregister or purge.
@@ -282,9 +337,20 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     /// The field keeps its identity and physical storage location; only
     /// the segments are rewritten under `new_config`. Implementations must
     /// leave the field's existing data completely untouched if the rebuild
-    /// fails partway through (e.g. by writing new segments before
-    /// atomically publishing them, the way [`Self::optimize`] already
-    /// does).
+    /// fails before it publishes the rewritten segments (e.g. by writing
+    /// new segments before atomically publishing them, the way
+    /// [`Self::optimize`] already does). Once they are published, the field
+    /// uses them and the call returns `Ok`; a failing cleanup step after
+    /// that is logged, not returned, because a caller such as
+    /// `Engine::update_field` updates the schema only on `Ok` (Issue
+    /// #1538).
+    ///
+    /// The documents deleted since the last [`Self::persist_deletions`] stay
+    /// deleted (Issue #1527): the rebuild drops them, as it drops the ones
+    /// deleted before. The caller must not soft delete a document while the
+    /// rebuild runs, or the delete can land on the field's index being
+    /// replaced and be lost. `Engine::update_field` blocks deletes for the
+    /// whole call.
     ///
     /// Only valid for parameters that do not change the meaning of
     /// already-written vectors (dimension, distance metric, and embedder
@@ -298,8 +364,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug {
     ///
     /// The default implementation always errors; callers must gate on
     /// [`Self::supports_dynamic_fields`] first. Implementations also error
-    /// if no field named `name` is registered, or if the rebuild itself
-    /// fails.
+    /// if no field named `name` is registered, or if the rebuild fails
+    /// before it publishes the rewritten segments, which leaves the field
+    /// as it was.
     fn rebuild_field(&self, _name: &str, _new_config: VectorIndexTypeConfig) -> Result<()> {
         Err(LaurusError::InvalidOperation(
             "this index type does not support rebuilding fields dynamically".to_string(),

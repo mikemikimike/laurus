@@ -15,6 +15,10 @@ use laurus::{
 };
 
 use crate::convert::document;
+use crate::convert::json::{
+    json_optional_bool, json_optional_f64, json_optional_object, json_optional_str,
+    json_optional_string_array, json_optional_u32, json_optional_u64, json_to_string_array,
+};
 use crate::proto::laurus::v1;
 
 /// Build a laurus SearchRequest from a proto SearchRequest.
@@ -23,20 +27,45 @@ use crate::proto::laurus::v1;
 /// ([`SearchQuery::Dsl`](laurus::SearchQuery::Dsl)): the engine parses its
 /// lexical and vector clauses. `query_vectors` are added to its vector part
 /// (Issue #1366). `lexical_params` and `field_boosts` set the lexical options
-/// of a request that has a `query`.
+/// of a request that has a `query`; `field_boosts` and
+/// `lexical_params.min_score` are passed without one too, so that the engine
+/// rejects an out-of-range value (Issue #1540).
 #[allow(clippy::result_large_err)]
 pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, tonic::Status> {
     let mut builder = SearchRequestBuilder::new();
 
+    // An unknown order is rejected even where `sort_by` has no effect (no
+    // `query`, or an empty `field`), instead of sorting ascending (Issue
+    // #1476).
+    let sort_order = proto
+        .lexical_params
+        .as_ref()
+        .and_then(|p| p.sort_by.as_ref())
+        .map(|spec| match v1::SortOrder::try_from(spec.order) {
+            Ok(v1::SortOrder::Asc) => Ok(SortOrder::Asc),
+            Ok(v1::SortOrder::Desc) => Ok(SortOrder::Desc),
+            Err(_) => Err(tonic::Status::invalid_argument(format!(
+                "lexical_params: unknown sort_by.order {}",
+                spec.order
+            ))),
+        })
+        .transpose()?;
+
+    // The boosts and the lexical min_score are passed even without a
+    // `query`, where they have no effect, so that the engine rejects an
+    // out-of-range value there too (Issue #1540), as an unknown sort order
+    // is rejected above. A vector-only search never reads them.
+    for (field, boost) in &proto.field_boosts {
+        builder = builder.add_field_boost(field.clone(), *boost);
+    }
+    if let Some(p) = &proto.lexical_params {
+        builder = builder.lexical_min_score(p.min_score);
+    }
+
     if !proto.query.is_empty() {
         builder = builder.query_dsl(proto.query.clone());
 
-        for (field, boost) in &proto.field_boosts {
-            builder = builder.add_field_boost(field.clone(), *boost);
-        }
-
         if let Some(p) = &proto.lexical_params {
-            builder = builder.lexical_min_score(p.min_score);
             if let Some(timeout_ms) = p.timeout_ms
                 && timeout_ms > 0
             {
@@ -46,12 +75,9 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
                 builder = builder.lexical_parallel(true);
             }
             if let Some(spec) = &p.sort_by
+                && let Some(order) = sort_order
                 && !spec.field.is_empty()
             {
-                let order = match v1::SortOrder::try_from(spec.order) {
-                    Ok(v1::SortOrder::Desc) => SortOrder::Desc,
-                    _ => SortOrder::Asc,
-                };
                 builder = builder.sort_by(SortField::Field {
                     name: spec.field.clone(),
                     order,
@@ -89,7 +115,9 @@ pub fn from_proto(proto: &v1::SearchRequest) -> Result<laurus::SearchRequest, to
     }
     builder = builder.offset(proto.offset as usize);
 
-    // Fusion
+    // Fusion. The engine checks the RRF `k` and the weights (Issue #1540).
+    // proto3 sends an unset `k` as 0, which it accepts, and unset weights as
+    // 0 and 0, which it rejects.
     if let Some(fusion) = &proto.fusion
         && let Some(alg) = &fusion.algorithm
     {
@@ -317,10 +345,10 @@ fn rescore_from_proto(params: &v1::RescoreParams) -> Result<RescoreOptions, toni
 /// ```
 ///
 /// `late_interaction` takes exactly one of `vectors` (equal-length numeric
-/// arrays) and `text`; `window_size` is optional. Unlike the other search
-/// options, a malformed value is an error rather than ignored: the caller
-/// asked for a rescore explicitly, and dropping it would silently return the
-/// first-stage ranking.
+/// arrays) and `text`, where `null` is the same as omitting the key (Issue
+/// #1524); `window_size` is optional. A malformed value is an error rather
+/// than ignored: the caller asked for a rescore explicitly, and dropping it
+/// would silently return the first-stage ranking.
 ///
 /// # Errors
 ///
@@ -348,7 +376,10 @@ pub fn rescore_params_from_json(json: &serde_json::Value) -> Result<v1::RescoreP
         .and_then(Value::as_str)
         .ok_or("rescore.late_interaction.field must be a string")?
         .to_string();
-    let query = match (late.get("vectors"), late.get("text")) {
+    // `null` is the same as omitting the key, as for every other key of the
+    // gateway (Issue #1524); it used to count as the key being set.
+    let present = |key: &str| late.get(key).filter(|v| !v.is_null());
+    let query = match (present("vectors"), present("text")) {
         (Some(vectors), None) => {
             v1::late_interaction_rescore::Query::Vectors(token_vectors_from_json(vectors)?)
         }
@@ -409,6 +440,147 @@ fn token_vectors_from_json(json: &serde_json::Value) -> Result<v1::VectorArrayVa
         dimension: dimension as u32,
         values,
     })
+}
+
+/// Parse the JSON form of [`v1::FusionAlgorithm`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP `search` tool (Issue #1523):
+/// exactly one of `{"rrf": {"k": 60}}` and `{"weighted_sum":
+/// {"lexical_weight": 0.5, "vector_weight": 0.5}}`, whose numbers default to
+/// the values shown.
+///
+/// # Errors
+///
+/// Returns a message when `json` is not an object, when `rrf` or
+/// `weighted_sum` is present and not `null` but not an object, when one of
+/// their keys is present and not `null` but not a number, or when neither or
+/// both are set. These used to fall back to the default (k 60, weights 0.5,
+/// or no `fusion`), and `rrf` won over `weighted_sum` (Issue #1524).
+/// `"rrf": null` is the same as omitting `rrf`. A number of the right type
+/// but out of range, such as a negative `k`, is rejected by the engine
+/// (Issue #1540).
+pub fn fusion_algorithm_from_json(json: &serde_json::Value) -> Result<v1::FusionAlgorithm, String> {
+    use v1::fusion_algorithm::Algorithm;
+    let obj = json.as_object().ok_or("fusion must be an object")?;
+    let error = |message: String| format!("fusion: {message}");
+    let rrf = json_optional_object(obj, "rrf").map_err(error)?;
+    let weighted_sum = json_optional_object(obj, "weighted_sum").map_err(error)?;
+    let algorithm = match (rrf, weighted_sum) {
+        (Some(rrf), None) => {
+            let k = json_optional_f64(rrf, "k")
+                .map_err(|e| error(format!("rrf: {e}")))?
+                .unwrap_or(60.0);
+            Algorithm::Rrf(v1::Rrf { k })
+        }
+        (None, Some(ws)) => {
+            let weight = |key: &str| {
+                json_optional_f64(ws, key)
+                    .map(|w| w.unwrap_or(0.5) as f32)
+                    .map_err(|e| error(format!("weighted_sum: {e}")))
+            };
+            Algorithm::WeightedSum(v1::WeightedSum {
+                lexical_weight: weight("lexical_weight")?,
+                vector_weight: weight("vector_weight")?,
+            })
+        }
+        _ => {
+            return Err("fusion must have exactly one of \"rrf\" and \"weighted_sum\"".to_string());
+        }
+    };
+    Ok(v1::FusionAlgorithm {
+        algorithm: Some(algorithm),
+    })
+}
+
+/// Parse the JSON form of the field boosts (`{"title": 2.0}`), shared by the
+/// HTTP gateway's `POST /v1/search` and the MCP `search` tool (Issue #1523).
+/// A `null` boost is the same as omitting the field.
+///
+/// # Errors
+///
+/// Returns a message when `json` is not an object, or naming the field when
+/// its boost is not a number, such as `"2"`, which used to be dropped (Issue
+/// #1524). A negative or infinite boost is rejected by the engine (Issue
+/// #1540).
+pub fn field_boosts_from_json(json: &serde_json::Value) -> Result<HashMap<String, f32>, String> {
+    json.as_object()
+        .ok_or("field_boosts must be an object")?
+        .iter()
+        .filter(|(_, boost)| !boost.is_null())
+        .map(|(field, boost)| {
+            boost
+                .as_f64()
+                .map(|boost| (field.clone(), boost as f32))
+                .ok_or_else(|| format!("field_boosts: \"{field}\" must be a number"))
+        })
+        .collect()
+}
+
+/// Parse the JSON form of [`v1::HighlightParams`], shared by the HTTP
+/// gateway's `POST /v1/search` and the MCP search tools (Issues #1134,
+/// #1523). Accepts either the array shorthand (just a field list) —
+/// `["title", "body"]` — or the full object form —
+/// `{"fields": ["body"], "max_fragments": 2, "tag": "em", ...}`. Returns
+/// `Ok(None)` for `null` and for an empty field list (`[]`, `{}` or
+/// `{"fields": []}`), which the gateway treats the same as an absent
+/// `highlight` key and the MCP tools reject; [`from_proto`] rejects an
+/// explicitly empty field list, but these have the right types and request
+/// nothing.
+///
+/// # Errors
+///
+/// Returns an error when `json` is neither an array of strings nor an
+/// object, when `fields` is present and not `null` but not an array of
+/// strings, or `tag` or `css_class` not a string, instead of dropping the
+/// value (Issue #1524), when `max_fragments` or `fragment_size` is present
+/// and not `null` but not an integer that fits `u32`, or
+/// `max_analyzed_chars` one that fits `u64`, instead of using the default or
+/// wrapping (Issue #1490), or when `require_field_match` or
+/// `return_entire_field_if_no_highlight` is present and not `null` but not
+/// `true` or `false`, instead of using the default (Issue #1511). Every key
+/// is checked even when the field list is empty.
+pub fn highlight_params_from_json(
+    json: &serde_json::Value,
+) -> Result<Option<v1::HighlightParams>, String> {
+    use serde_json::Value;
+
+    const SHAPE: &str = "highlight must be an array of strings or an object";
+    let obj = match json {
+        Value::Null => return Ok(None),
+        Value::Array(_) => {
+            let fields = json_to_string_array(json).ok_or_else(|| SHAPE.to_string())?;
+            return Ok((!fields.is_empty()).then(|| v1::HighlightParams {
+                fields,
+                ..Default::default()
+            }));
+        }
+        Value::Object(obj) => obj,
+        _ => return Err(SHAPE.to_string()),
+    };
+    let error = |message: String| format!("highlight: {message}");
+    let fields = json_optional_string_array(obj, "fields")
+        .map_err(error)?
+        .unwrap_or_default();
+    let max_fragments = json_optional_u32(obj, "max_fragments").map_err(error)?;
+    let fragment_size = json_optional_u32(obj, "fragment_size").map_err(error)?;
+    let tag = json_optional_str(obj, "tag").map_err(error)?;
+    let css_class = json_optional_str(obj, "css_class").map_err(error)?;
+    let max_analyzed_chars = json_optional_u64(obj, "max_analyzed_chars").map_err(error)?;
+    let require_field_match = json_optional_bool(obj, "require_field_match").map_err(error)?;
+    let return_entire_field_if_no_highlight =
+        json_optional_bool(obj, "return_entire_field_if_no_highlight").map_err(error)?;
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(v1::HighlightParams {
+        fields,
+        max_fragments,
+        fragment_size,
+        tag: tag.map(str::to_string),
+        css_class: css_class.map(str::to_string),
+        require_field_match,
+        max_analyzed_chars,
+        return_entire_field_if_no_highlight,
+    }))
 }
 
 /// Whether `params` sets any field beyond `fields`, i.e. whether a
@@ -617,6 +789,37 @@ mod tests {
         assert_eq!(params.window_size, None);
     }
 
+    /// Issue #1524: `null` for one of `vectors` and `text` is the same as
+    /// omitting it; it used to count as set, so the request was rejected
+    /// for having both.
+    #[test]
+    fn rescore_params_from_json_reads_null_as_omitted() {
+        let query = |late_interaction: serde_json::Value| {
+            let params = rescore_params_from_json(&serde_json::json!({
+                "late_interaction": late_interaction
+            }));
+            match params.map(|p| p.rescorer) {
+                Ok(Some(v1::rescore_params::Rescorer::LateInteraction(late))) => Ok(late.query),
+                other => Err(format!("{other:?}")),
+            }
+        };
+        assert_eq!(
+            query(serde_json::json!({"field": "t", "text": "rust", "vectors": null})),
+            Ok(Some(v1::late_interaction_rescore::Query::Text(
+                "rust".to_string()
+            )))
+        );
+        assert_eq!(
+            query(serde_json::json!({"field": "t", "vectors": [[1, 0]], "text": null})),
+            Ok(Some(v1::late_interaction_rescore::Query::Vectors(
+                v1::VectorArrayValue {
+                    dimension: 2,
+                    values: vec![1.0, 0.0],
+                }
+            )))
+        );
+    }
+
     #[test]
     fn rescore_params_from_json_rejects_malformed_values() {
         let cases = [
@@ -636,6 +839,10 @@ mod tests {
             ),
             (
                 serde_json::json!({"late_interaction": {"field": "t", "text": "q", "vectors": [[1]]}}),
+                "exactly one of vectors and text",
+            ),
+            (
+                serde_json::json!({"late_interaction": {"field": "t", "text": null, "vectors": null}}),
                 "exactly one of vectors and text",
             ),
             (
@@ -944,6 +1151,77 @@ mod tests {
         })
         .unwrap();
         assert_non_field_params(&with_vector_params);
+    }
+
+    /// Issue #1540: `field_boosts` and `lexical_params.min_score` reach the
+    /// engine without a `query` too, so that it can reject an out-of-range
+    /// value there, while the options only a lexical query uses stay unset.
+    #[test]
+    fn from_proto_passes_boosts_and_min_score_without_a_query() {
+        let request = from_proto(&v1::SearchRequest {
+            query_vectors: vec![query_vector(&[])],
+            lexical_params: Some(v1::LexicalParams {
+                min_score: f32::NAN,
+                timeout_ms: Some(5),
+                parallel: true,
+                ..Default::default()
+            }),
+            field_boosts: [("title".to_string(), -1.0)].into_iter().collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        let options = &request.lexical_options;
+        assert!(options.min_score.is_nan(), "{options:?}");
+        assert_eq!(options.field_boosts.get("title"), Some(&-1.0));
+        assert_eq!(options.timeout_ms, None);
+        assert!(!options.parallel);
+    }
+
+    /// Issue #1476: an unknown `SortOrder` is `INVALID_ARGUMENT` instead of
+    /// an ascending sort, even where `sort_by` has no effect (no `query`, or
+    /// an empty `field`), and ASC and DESC sort as asked.
+    #[test]
+    fn from_proto_rejects_an_unknown_sort_order() {
+        let request = |query: &str, field: &str, order: i32| v1::SearchRequest {
+            query: query.to_string(),
+            query_vectors: vec![query_vector(&[])],
+            lexical_params: Some(v1::LexicalParams {
+                sort_by: Some(v1::SortSpec {
+                    field: field.to_string(),
+                    order,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Every request that is not rejected as expected, so a failure lists
+        // all of them rather than the first.
+        let mut wrong = Vec::new();
+        for (query, field) in [("title:rust", "year"), ("", "year"), ("title:rust", "")] {
+            for order in [2, 7, -1] {
+                let status = from_proto(&request(query, field, order)).err();
+                let expected = format!("lexical_params: unknown sort_by.order {order}");
+                let got = status.as_ref().map(|s| (s.code(), s.message()));
+                if got != Some((tonic::Code::InvalidArgument, expected.as_str())) {
+                    wrong.push(format!("{query:?} {field:?} {order}: {status:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        for (order, expected) in [
+            (v1::SortOrder::Asc, SortOrder::Asc),
+            (v1::SortOrder::Desc, SortOrder::Desc),
+        ] {
+            let sorted = from_proto(&request("title:rust", "year", order as i32)).unwrap();
+            assert_eq!(
+                sorted.lexical_options.sort_by,
+                SortField::Field {
+                    name: "year".to_string(),
+                    order: expected
+                }
+            );
+        }
     }
 
     /// proto3 cannot tell an unset `float` from `0.0`: `overfetch == 0`

@@ -308,7 +308,7 @@ documents: [
 
 ## delete_field
 
-インデックスからフィールドを削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。
+インデックスからフィールドを削除します。既にインデックスされたデータは残りますが、削除されたフィールドにはアクセスできなくなります。あとで同じ名前のベクトルフィールドを追加すると、空の状態から始まります（[フィールドの削除](../concepts/schema_and_fields.md#フィールドの削除)を参照）。
 
 ### パラメーター
 
@@ -381,9 +381,9 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `query` | string | はい | laurus 統一クエリ DSL による検索クエリ |
 | `limit` | integer | いいえ | 最大結果数（デフォルト: 10）。`offset + limit` はサーバの `max_result_window`（既定 10,000）以下にする |
 | `offset` | integer | いいえ | ページネーション用スキップ数（デフォルト: 0） |
-| `fusion` | string | いいえ | ハイブリッド検索用の融合アルゴリズム（JSON） |
-| `field_boosts` | string | いいえ | フィールド毎のブースト係数（JSON） |
-| `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)を参照） |
+| `fusion` | string | いいえ | ハイブリッド検索用の融合アルゴリズム（JSON、[値の型](#値の型)を参照） |
+| `field_boosts` | string | いいえ | フィールド毎のブースト係数（JSON、[値の型](#値の型)を参照） |
+| `highlight` | string | いいえ | フィールドごとのハイライト済みフラグメント（JSON、[ハイライトの例](#ハイライトの例)と[値の型](#値の型)を参照） |
 | `rescore` | string | いいえ | 上位の結果の late interaction による再採点（JSON、[再採点の例](#再採点の例)を参照） |
 | `group_by` | string | いいえ | 結果のフィールド値によるグループ化（JSON）。指定すると `limit` と `offset` はグループの数を数える（[グループ化の例](#グループ化の例)を参照） |
 
@@ -439,11 +439,15 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 {"weighted_sum": {"lexical_weight": 0.7, "vector_weight": 0.3}}
 ```
 
+`k` は `0` 以上、各重みは `0` 以上 `1` 以下で、少なくとも一方が `0` より大きくなければなりません。それ以外の値はサーバーが拒否し、ツールはそのエラーを返します（Issue #1540）。
+
 ### フィールドブーストの例
 
 ```json
 {"title": 2.0, "body": 1.0}
 ```
+
+各ブーストは `0` 以上でなければなりません（`-0` は拒否されます）。それ以外のブーストはサーバーが拒否し、ツールはそのエラーを返します（Issue #1540）。
 
 ### ハイライトの例
 
@@ -458,6 +462,24 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 ```json
 {"fields": ["body"], "max_fragments": 2, "tag": "em"}
 ```
+
+### 値の型
+
+`fusion`・`field_boosts`・`highlight` は、HTTP ゲートウェイの[検索](../laurus-server/http_gateway.md#検索)と同じ JSON を取ります（Issue #1523）。
+
+- `fusion` には `rrf`（`{"k": 60}`）と `weighted_sum`（`{"lexical_weight": 0.5, "vector_weight": 0.5}`）のどちらか一方だけを指定します。どちらもオブジェクトで、数値を省略すると、ここに示した値になります。
+- `field_boosts` の各ブーストは数値です。
+- `highlight` のフィールド名は文字列、`max_fragments` と `fragment_size` は `0` から `4294967295` までの整数、`max_analyzed_chars` は `0` から `18446744073709551615` までの整数、`require_field_match` と `return_entire_field_if_no_highlight` は `true` か `false`、`tag` と `css_class` は文字列です。
+
+`null` はキーの省略と同じです。パラメータ全体を指定しないときは、パラメータを省略します。文字列の `null` はツールエラーになります（HTTP ゲートウェイは `null` の `fusion`・`field_boosts`・`highlight` を省略として読みます）。ほかの型の値と範囲外の整数は、キーを名指しするツールエラーになり、検索は行われません。たとえば `highlight` の `{"fields": ["body"], "max_fragments": "1"}` は次のエラーを返します。
+
+```text
+Invalid highlight JSON: highlight: max_fragments must be an integer between 0 and 4294967295
+```
+
+この修正より古い laurus-mcp は、そうした値を省略として読んでいました。`{"rrf": {"k": "1"}}` は `k` が 60 になり、`{"title": "2"}` は何もブーストしませんでした。また、文字列でないフィールド名を捨て、`4294967295` を超える `max_fragments`・`fragment_size` を折り返し（`4294967297` は `1` になる）、2 つのアルゴリズムの両方があれば `rrf` を使っていました。
+
+HTTP ゲートウェイと違い、`highlight` はフィールドを 1 つ以上指定しなければなりません。`[]`・`{}`・`{"fields": []}` は、ハイライトを要求しないことではなく、ツールエラーになります。
 
 ### 再採点の例
 
@@ -529,7 +551,7 @@ laurus 統一クエリ DSL を使用してドキュメントを検索します�
 | `queries` | 文字列の配列 | はい | laurus 統一クエリ DSL のクエリ文字列（`search` と同じ構文） |
 | `limit` | 整数 | いいえ | クエリごとの最大結果数（デフォルト: 10）。`offset + limit` はサーバの `max_result_window`（既定 10,000）以下にする |
 | `offset` | 整数 | いいえ | クエリごとのページネーションオフセット（デフォルト: 0） |
-| `highlight` | 文字列 | いいえ | フィールドごとのハイライト済みフラグメント（JSON）。`search` の `highlight` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
+| `highlight` | 文字列 | いいえ | フィールドごとのハイライト済みフラグメント（JSON）。`search` の `highlight` と同じ形式と[値の型](#値の型)で、バッチ内のすべてのクエリに同一に適用される |
 | `group_by` | 文字列 | いいえ | 各クエリの結果のフィールド値によるグループ化（JSON）。`search` の `group_by` と同じ形式で、バッチ内のすべてのクエリに同一に適用される |
 
 ### 結果

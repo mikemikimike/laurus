@@ -731,8 +731,25 @@ When a field is deleted:
 - Existing indexed data for the field **remains** in the index but becomes
   inaccessible through queries.
 - If the field was listed in `default_fields`, it is automatically removed.
+- If the field was listed in `pending_reindex`, it is removed from it too, so
+  `GetSchema` no longer reports the field as having lost its data. A
+  `schema.toml` written before
+  [#1548](https://github.com/mosuka/laurus/issues/1548) can still name a
+  deleted field there. The engine drops such a name when it opens the index,
+  so the schema it persists after the next `add_field`, `delete_field` or
+  `update_field` no longer has it. `GetSchema` and `laurus get schema` read
+  `schema.toml`, so they show the name until then.
 - Any per-field analyzer or embedder registered for the field is
   unregistered.
+
+Adding a vector field with the same name later does not bring its data back:
+`Engine::add_field()` discards the files the deleted field left and starts
+the field empty (Issue #1535). Deletes stop reaching a field once it is
+removed, so its old data would return deleted documents, and it may have been
+written under another dimension or index kind. Documents put before the
+deletion still return their old value for the field from the document store,
+but no vector search finds them by it; put them again to index them. Adding
+a vector field commits first, as `Engine::commit()` does.
 
 ### Changing a Field
 
@@ -765,6 +782,15 @@ The requested change is classified into one of three kinds, reported as
 pass `UpdateFieldOptions { reindex: true, .. }` — an opt-in gate against
 accidentally triggering an expensive rebuild or a data-losing change.
 
+A `Reindex` keeps the deletes and updates made since the last `commit()`:
+a deleted document does not come back in search after the rebuild
+([#1527](https://github.com/mosuka/laurus/issues/1527)).
+
+A vector field's `Reindex` succeeds once it has published the rebuilt
+segments. A cleanup step that fails after that is logged as a warning that
+names the field, and the field uses the rebuilt segments
+([#1538](https://github.com/mosuka/laurus/issues/1538)).
+
 Applying a `Destructive` change records the field's name in the schema's
 `pending_reindex` set. This is a visibility mechanism against the known
 Solr failure mode where the schema and the index silently drift apart —
@@ -780,6 +806,18 @@ embedder registered directly through `EngineBuilder::embedder` in place.
 
 Pass `UpdateFieldOptions { dry_run: true, .. }` to see how a change would
 be classified without applying anything.
+
+A vector field's segment manifest records the index kind, `dimension` and
+`distance` its files are written with, and the index opens only under a
+schema that gives the field the same three
+([#1547](https://github.com/mosuka/laurus/issues/1547)). Change them with
+`update_field` rather than in the schema the index is opened with: a
+`dimension` or `distance` change is `Destructive`. A change of kind is
+classified as `Reindex` but fails, since the field's files cannot be read
+as another kind ([#1536](https://github.com/mosuka/laurus/issues/1536));
+delete the field and add it again instead. See
+[Editing an existing vector field](../laurus-cli/schema_format.md#editing-an-existing-vector-field)
+for what may still change in `schema.toml`.
 
 ## Schema Design Tips
 

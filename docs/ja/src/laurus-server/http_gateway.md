@@ -72,6 +72,8 @@ curl -X POST http://localhost:8080/v1/index \
 
 `dynamic_field_policy` は省略可能なキーで、スキーマに宣言されていないフィールドの扱いを制御します。指定できる値は `"strict"` / `"dynamic"`（デフォルト）/ `"ignore"` の 3 種類です。`null` はキーの省略と同じで、ほかの値（文字列でない値を含む）は 400 で拒否されます（Issue #1473）。詳細および `"dynamic"` での情報損失に関する警告は [スキーマとフィールド](../concepts/schema_and_fields.md#動的スキーマ) を参照してください。
 
+`schema` はオブジェクト、`default_fields` は文字列の配列、`analyzers` と `embedders` はオブジェクトでなければなりません。アナライザーの `char_filters` と `token_filters` は配列です。これらのキーの `null` は省略と同じです。`"default_fields": "title"` や `"default_fields": [1, "title"]` などそれ以外の値は 400 で拒否され、インデックスは作られません（Issue #1524）。この修正より古いサーバーは、そうした値を省略として読むか、文字列でない要素を捨てていました。
+
 ### インデックス統計情報の取得
 
 ```bash
@@ -85,6 +87,8 @@ curl http://localhost:8080/v1/schema
 ```
 
 レスポンスの `text` / `integer` / `float` / `boolean` / `date_time` / `geo` / `geo3d` / `bytes` オプションには常に `multi_valued` が含まれます（例: `"location": {"geo": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"seen_at": {"date_time": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"flags": {"boolean": {"indexed": true, "stored": true, "multi_valued": true, "doc_values": true}}`、`"notes": {"text": {"indexed": true, "stored": true, "multi_valued": true, "position_increment_gap": 100}}`、または `"thumbnail": {"bytes": {"stored": true, "multi_valued": true}}`）。同じキーは `POST /v1/index` および `POST /v1/schema/fields` でも受け付けます。これらのオプションの真偽値のキー（`indexed`・`stored`・`multi_valued`・`doc_values`・`term_vectors`）は `true` か `false` で、`null` はキーの省略と同じです。省略すると、`indexed`・`stored`・`multi_valued` は `false`、`doc_values` と `term_vectors` はエンジンのデフォルトになります。`"true"`・`1` などそれ以外の値は、省略として読まれるのではなく 400 で拒否され、何も書き込まれません（Issue #1511）。`text` オプションの `position_increment_gap`（Issue #1175）は入力では省略でき（省略時は `0` ではなくエンジンのデフォルト `100` を意味します）、レスポンスには常に含まれます。値は `0` から `4294967295` までの整数で、`null` は省略と同じです。`"0"`・`-1`・`4294967296` などそれ以外の値は、省略として読まれるのではなく 400 で拒否されます（Issue #1490）。`bytes` オプションには `indexed` も `doc_values` もありません —— `Bytes` の値は `multi_valued` にかかわらずインデックスされず、DocValues にも書き込まれません（Issue #1176）。
+
+フィールドオプションの型のキー（`"text"` や `"hnsw"` など）はちょうど 1 つで、その値はオブジェクトです。ほかの型のキーと並んだ `null` の型のキーは、省略と同じです。`{"text": 1}`・`{"text": null}`・`{"text": {}, "integer": {}}` は、`POST /v1/index`・`POST /v1/schema/fields`・`PATCH /v1/schema/fields/{name}` で 400 で拒否され、何も書き込まれません（Issue #1524）。この修正より古いサーバーは、`{"text": 1}` をインデックスも保存もしない `text` フィールドとして読み、型のキーが 2 つあれば先のものを使っていました。`text` オプションの `analyzer` は名前か、`{"language": "japanese", "dict": "...", "mode": "normal"}` のようなオブジェクトで、その `mode` と `user_dict` は文字列です。`analyzer`・`mode`・`user_dict` の `null` は省略と同じです。この修正より古いサーバーは、`"analyzer": null` を 400 で拒否していました。
 
 MultiVector フィールド（Issue #1177）は `"body_colbert": {"multi_vector": {"dimension": 128, "distance": "cosine"}}` のように宣言します（`distance` は `"cosine"` または `"dot_product"`、省略時は `"cosine"`）。文書での値は、トークンベクトルごとの同じ長さの数値配列の配列です（`"body_colbert": [[0.1, 0.2, ...], [0.3, 0.4, ...]]`）。このフィールドは late interaction の再採点のためにトークンベクトルを保持するもので、ベクトル検索の対象にはならず、文書とともに返されることもありません。
 
@@ -152,6 +156,8 @@ curl -X POST http://localhost:8080/v1/index \
 
 `hnsw` フィールドには `default_ef_search` も指定できます。検索が `vector_params.ef_search` を指定しないときに、そのフィールドの検索で使う候補リストの大きさです（Issue #644。[スキーマとフィールドの `default_ef_search`](../concepts/schema_and_fields.md#default_ef_search-検索時の-recall-調整パラメータ) を参照）。`m` と同じく `0` から `4294967295` までの整数で、`"64"`・`64.0`・`-1` などそれ以外の値は 400 で拒否され、何も書き込まれません（Issue #1490）。省略するか `null` にすると未設定のままで、レスポンスには設定したときだけ出ます。この修正より古いサーバーは、そうした値を未設定として読み、`4294967295` を超える値を折り返し（`4294967360` は `64` になる）、レスポンスのスキーマに `default_ef_search` を出しませんでした。`PATCH /v1/schema/fields/{name}` はオプション全体を置き換えるので、そうしたレスポンスからコピーしたフィールドで PATCH すると、コピーに設定し直さない限り `default_ef_search` は消えます。
 
+ベクトルフィールドの `base_weight` は数値、`embedder`（と `hnsw` フィールドの `pq_codebook_path`）は文字列です。`null` は省略と同じです。`"base_weight": "2"` などそれ以外の値は 400 で拒否され、何も書き込まれません（Issue #1524）。この修正より古いサーバーはそうした値を省略として読むので、`"base_weight": "2"` はエンジンのデフォルトの `1.0` になっていました。
+
 ### フィールドの動的追加
 
 稼働中のインデックスにフィールドを追加します。リクエストボディは `POST /v1/index` と同じ `FieldOption` JSON 形式を使います:
@@ -175,7 +181,7 @@ curl -X POST http://localhost:8080/v1/schema/fields \
 curl -X DELETE http://localhost:8080/v1/schema/fields/category
 ```
 
-既にインデックスされたデータはストレージに残りますが、アクセスできなくなります。フィールド固有のアナライザとエンベッダーは解除されます。
+既にインデックスされたデータはストレージに残りますが、アクセスできなくなります。フィールド固有のアナライザとエンベッダーは解除されます。あとで同じ名前のベクトルフィールドを追加すると、空の状態から始まります（[フィールドの削除](../concepts/schema_and_fields.md#フィールドの削除)を参照）。
 
 ### フィールドの変更
 
@@ -267,7 +273,7 @@ curl -X POST 'http://localhost:8080/v1/documents:bulk?mode=put' \
 
 適用できない最初のエントリで fail-fast します。適用済みエントリはロールバックされず（次のコミットで永続化）、エラーには失敗位置が含まれるため、バッチまたはその suffix の再試行は冪等です。
 
-write-ahead log のレコードを書いた後に失敗した書き込み（I/O エラー、ディスク容量不足）は、書き込みを止めます。以後の書き込み・コミット・フィールド変更は、サーバーを再起動するまで `412 Precondition Failed` を返します。再起動するとログが再生され、その書き込みが適用されます（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照）。リクエストがキャンセルされても、クライアントが切断しても、書き込みは止まりません。各ドキュメントは、すべて適用されているか、まったく書かれていないかのどちらかです。キャンセルまでに適用されたドキュメントは、適用されたまま残ります。
+write-ahead log への追記以降に失敗した書き込み（I/O エラー、ディスク容量不足）は、書き込みを止めます。以後の書き込み・コミット・フィールド変更は、サーバーを再起動するまで `412 Precondition Failed` を返します。再起動するとログが再生され、レコードがログに完全に届いていればその書き込みが丸ごと適用され、届いていなければ適用されません。一部だけが適用されることはありません（[失敗した書き込み](../laurus/persistence.md#失敗した書き込み)を参照）。リクエストがキャンセルされても、クライアントが切断しても、書き込みは止まりません。各ドキュメントは、すべて適用されているか、まったく書かれていないかのどちらかです。キャンセルまでに適用されたドキュメントは、適用されたまま残ります。
 
 ### ドキュメントの取得
 
@@ -305,7 +311,25 @@ curl -X POST http://localhost:8080/v1/search \
 
 `limit` と `offset` は、省略または `null` のとき既定値（10 と 0）になります。Issue #1367 以降、0 以上の整数でない値や、32 ビット符号なし整数に収まらない値は `400 Bad Request` で拒否されます（以前は既定値に置き換わるか、折り返していました）。`offset + limit` がサーバの [`max_result_window`](configuration.md)（既定 10,000）を超える検索も `400 Bad Request` で拒否されます。
 
-`lexical_params` には、gRPC の [`LexicalParams`](grpc_api.md#lexicalparams) メッセージのキーを snake_case で指定します。`timeout_ms` は `0` から `18446744073709551615` までの整数で、省略・`null`・`0` はタイムアウトなしを意味します。`"500"`・`500.0`・`-1` などそれ以外の値は、タイムアウトなしで検索するのではなく `400 Bad Request` で拒否されます（Issue #1490）。`parallel` は `true` か `false` で、省略と `null` は `false` を意味します。`"true"`・`1` などそれ以外の値は、`false` として読まれるのではなく `400 Bad Request` で拒否されます（Issue #1511）。
+`lexical_params` には、gRPC の [`LexicalParams`](grpc_api.md#lexicalparams) メッセージのキーを snake_case で指定します。`timeout_ms` は `0` から `18446744073709551615` までの整数で、省略・`null`・`0` はタイムアウトなしを意味します。`"500"`・`500.0`・`-1` などそれ以外の値は、タイムアウトなしで検索するのではなく `400 Bad Request` で拒否されます（Issue #1490）。`parallel` は `true` か `false` で、省略と `null` は `false` を意味します。`"true"`・`1` などそれ以外の値は、`false` として読まれるのではなく `400 Bad Request` で拒否されます（Issue #1511）。`min_score` は数値で、省略と `null` は `0.0`（しきい値なし）を意味します。lexical スコアは負にならないので、負の `min_score` は `0.0` と同じです。gateway はこの値を 32 ビットの浮動小数点数に変換するため、`1e39` など約 `3.4e38` を超える数は無限大になり、`query` のない要求でも `400 Bad Request` で拒否されます（Issue #1540）。この修正より古いサーバーは、ヒットを 1 件も返しませんでした。
+
+本体は JSON のオブジェクト、`query` は文字列でなければなりません。`query` の省略と `null` はクエリなしを意味します。それ以外の値は `400 Bad Request` で拒否されます（Issue #1524）。この修正より古いサーバーは、文字列でない `query` をクエリなしとして読むので、`query_vectors` 付きの `"query": 5` はベクトルだけの検索になっていました。
+
+#### フィールドの値で並べる検索
+
+`lexical_params.sort_by` を指定すると、ヒットをスコアではなくフィールドの値で並べます。
+
+```bash
+curl -X POST http://localhost:8080/v1/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "body:rust",
+    "limit": 10,
+    "lexical_params": {"sort_by": {"field": "year", "order": "desc"}}
+  }'
+```
+
+`field` は文字列でなければならず、空文字列はスコア順を意味します。`order` は `"asc"` か `"desc"` で、大文字小文字を区別せずに受け付けます。省略と `null` は `"asc"` を意味します。gRPC の `"SORT_ORDER_DESC"` などの名前ではありません。オブジェクトでない `sort_by`、文字列の `field` を持たない `sort_by`、ほかの `order` は `400 Bad Request` で拒否されます（Issue #1476、#1524）。この修正より古いサーバーは、`"DESC"` などほかの `order` を昇順として読み、文字列の `field` を持たない `sort_by` ではスコア順に並べていました。`sort_by` が効くのは `query` のあるリクエストだけです。
 
 #### フィールドブースト付き検索
 
@@ -319,7 +343,9 @@ curl -X POST http://localhost:8080/v1/search \
   }'
 ```
 
-各キーは、スキーマの lexical フィールド（または `_id`）でなければなりません。打ち間違いなどの未知のフィールドやベクトルフィールドは、黙って無視されずに `400 Bad Request` で拒否されます（Issue #1374）。
+各キーは、スキーマの lexical フィールド（または `_id`）でなければなりません。打ち間違いなどの未知のフィールドやベクトルフィールドは、黙って無視されずに `400 Bad Request` で拒否されます（Issue #1374）。`field_boosts` はオブジェクトで、各ブーストは数値です。`null` のブーストはそのフィールドを書かないのと同じです。`{"title": "2"}` などそれ以外の値は、黙って捨てられるのではなく `400 Bad Request` で拒否されます（Issue #1524）。
+
+ブーストはそのフィールドのスコアに掛かるので、`0` 以上でなければなりません。`0` では、一致した文書が lexical スコア `0` で残ります。gateway は各ブーストを 32 ビットの浮動小数点数に変換するため、約 `3.4e38` を超える数は無限大になります。負のブースト（`-0` を含む）と無限大のブーストは `400 Bad Request` で拒否されます（Issue #1540）。フィールドとブーストは、`query` のない要求でも検査されます。この修正より古いサーバーは、負のブーストではヒットを隠し、`1e39` などのブーストでは `null` のスコアを返し、`query` のない要求の `field_boosts` を無視していました。
 
 #### ハイブリッド検索
 
@@ -335,6 +361,10 @@ curl -X POST http://localhost:8080/v1/search \
 ```
 
 `query_vectors` は `query` のベクトル部分に追加されるので、lexical 句だけの `query` は、`lexical_params` / `field_boosts` の有無にかかわらずハイブリッド検索になります（Issue #1366）。各要素には空でない数値の配列 `vector` が必要です。`weight`（数値）と `fields`（文字列の配列）は省略でき、`null` なら既定値のままです。それ以外の形は、黙って捨てずに `400 Bad Request` で拒否されます。
+
+`fusion` には `rrf`（`{"k": 60}`）と `weighted_sum`（`{"lexical_weight": 0.5, "vector_weight": 0.5}`）のどちらか一方だけを指定します。どちらもオブジェクトで、数値を省略するか `null` にすると、ここに示した値になります。`fusion` を省略すると、`k` が 60 の RRF になります。どちらもない、または両方ある `fusion` や、`{"rrf": {"k": "1"}}` のように型の違う値は `400 Bad Request` で拒否されます（Issue #1524）。この修正より古いサーバーは代わりに既定値を使い、両方あれば `rrf` を使っていました。
+
+`k` は `0` 以上でなければなりません。各結果リストは `1 / (k + rank)` を足します（`rank` は 1 始まり）。各重みは `0` 以上 `1` 以下で、少なくとも一方が `0` より大きくなければなりません。gateway は重みを 32 ビットの浮動小数点数に変換するため、`1e-50` など、表せないほど小さい正の重みは `0` になります。それ以外の値は、ハイブリッド部分のない要求でも `400 Bad Request` で拒否されます（Issue #1540）。この修正より古いサーバーは、重みを `[0, 1]` に丸め、`-1` などの `k` では `null` のスコアを返していました。
 
 #### ベクトル検索パラメータ付き検索
 
@@ -376,6 +406,8 @@ curl -X POST http://localhost:8080/v1/search \
 
 `require_field_match` と `return_entire_field_if_no_highlight` は `true` か `false` で、`null` はキーの省略と同じく既定値になります。`"true"`・`1` などそれ以外の値は、既定値に置き換わるのではなく、`fields` が空のときも含めて `400 Bad Request` で拒否されます（Issue #1511）。
 
+省略形の要素はすべて文字列で、オブジェクト形式の `fields` は文字列の配列、`tag` と `css_class` は文字列です。`null` はキーの省略と同じです。配列でもオブジェクトでもない `highlight` や、これらのキーの型の違う値は、黙って捨てられるのではなく `400 Bad Request` で拒否されます（Issue #1524）。空のフィールドのリスト（`[]`・`{}`・`{"fields": []}`）はハイライトを要求しないことを意味します。gRPC API は空の `HighlightParams.fields` を拒否します。
+
 各結果には、少なくとも1つのフィールドが実際にハイライトされた場合にのみ `"highlights"` オブジェクトが追加されます。
 
 ```json
@@ -405,7 +437,7 @@ curl -X POST http://localhost:8080/v1/search \
 "rescore": {"late_interaction": {"field": "body_colbert", "vectors": [[0.1, 0.2], [0.3, 0.4]]}}
 ```
 
-再採点した結果の `score` は late interaction（MaxSim）のスコアです。ほかの検索オプションと違い、不正な `rescore`（`field` がない、`vectors` と `text` の両方またはどちらもない、ベクトルの長さがそろわない）は無視されず 400 で拒否されます。エンジンが拒否する値も同じです（[gRPC の `RescoreParams`](grpc_api.md#rescoreparams) と [late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照）。
+再採点した結果の `score` は late interaction（MaxSim）のスコアです。不正な `rescore`（`field` がない、`vectors` と `text` の両方またはどちらもない、ベクトルの長さがそろわない）は無視されず 400 で拒否されます。エンジンが拒否する値も同じです（[gRPC の `RescoreParams`](grpc_api.md#rescoreparams) と [late interaction による再採点](../concepts/search/vector_search.md#late-interaction-による再採点rescore)を参照）。`vectors` と `text` の `null` は省略と同じです（Issue #1524）。
 
 #### グループ化付き検索
 
@@ -524,4 +556,4 @@ curl -X POST http://localhost:8080/v1/search \
 
 すべてのリクエストおよびレスポンスボディは JSON を使用します。JSON の構造は gRPC の protobuf メッセージに対応しています。メッセージ定義の詳細は [gRPC API リファレンス](grpc_api.md)を参照してください。
 
-真偽値を取るキーは、`true`・`false`・`null` だけを受け付けます。`null` はキーの省略と同じです。文字列の `"true"` や数値の `1` などそれ以外の値は `400 Bad Request` で拒否され、何も書き込まれず、検索も行われません（Issue #1511）。
+各キーは、上の各節で説明した JSON の型の値を取ります（多くは 1 つの型で、たとえば `highlight` は配列かオブジェクトを取ります）。省略できるキーでは、`null` は省略と同じです。ほかの型の値は、キーを名指しするメッセージ付きの `400 Bad Request` で拒否され、何も書き込まれず、検索も行われません。真偽値に対する文字列の `"true"` や数値の `1`（Issue #1511）、数値に対する文字列の `"2"`、文字列に対する数値の `1`、オブジェクトに対する文字列や配列（Issue #1524）がこれに当たります。これらの修正より古いサーバーは、そうした値を省略として読むか、捨てていました。アナライザーの文字フィルター・トークナイザー・トークンフィルターのパラメータは、まだこの検査の対象ではありません（Issue #1478）。`POST /v1/search/batch` では、メッセージが失敗したクエリの位置から始まり（`queries[1]: query must be a string` など）、どのクエリも実行されません。

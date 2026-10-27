@@ -12,7 +12,7 @@
 //!   search executes under a shared read lock, allowing concurrent queries.
 //! - **Writer cache** is protected by a `tokio::sync::Mutex`. Embedding (potentially slow
 //!   network I/O) and pooling are performed *outside* the lock. The engine takes the lock
-//!   right before a put's first WAL append and holds it until the put finished applying
+//!   right before a put's WAL append and holds it until the put finished applying
 //!   (Issue #1517), so the critical section is the WAL append, the lexical and
 //!   document-store writes and the `delete + add_vectors` step, all synchronous; a delete
 //!   takes it only when the index cannot delete softly.
@@ -446,9 +446,9 @@ impl VectorStore {
     /// Lock the writer for a put, creating it if there is none (Issues
     /// #1479, #1517).
     ///
-    /// `Engine::index_internal` takes it before the put's first WAL append
-    /// (its previous version's delete record, or its own record) and holds
-    /// it until the put finished applying, so nothing after that append
+    /// `Engine::index_internal` takes it before the put's WAL append (one
+    /// record, Issue #1522) and holds it until the put finished applying,
+    /// so nothing after that append
     /// waits: a put cancelled while it waits here has written nothing.
     /// Creating the writer is where a field the index cannot build with
     /// fails (an HNSW `m` below 2, or a product quantizer `subvector_count`
@@ -724,18 +724,23 @@ impl VectorStore {
     /// committed writer stays in the cache — its in-memory state is
     /// equivalent to the file it just wrote — so the first upsert after the
     /// commit does not reload the whole index from storage. The cache is
-    /// still dropped when auto-compaction ran: compaction rewrites the index
-    /// through a fresh writer and clears the deletion bitmap, so a retained
-    /// writer would resurrect the physically reclaimed vectors on its next
-    /// commit. The writer-cache lock is held across the whole ladder so a
-    /// concurrent upsert cannot interleave with the commit.
+    /// still dropped when auto-compaction ran or failed: compaction rewrites
+    /// the index through a fresh writer and clears the deletion bitmap, so a
+    /// retained writer would resurrect the physically reclaimed vectors on
+    /// its next commit. The writer-cache lock is held across the whole
+    /// ladder so a concurrent upsert cannot interleave with the commit.
+    ///
+    /// A failed automatic merge or compaction does not fail the commit
+    /// (Issue #1500): it runs after the commit's changes and WAL checkpoint
+    /// are durable, so it is logged as a warning and retried by the next
+    /// commit.
     ///
     /// # Errors
     ///
-    /// Returns an error if the writer commit, deletion persistence,
-    /// compaction, storage sync, or index refresh fails. The cached searcher
-    /// is dropped on every return, so the next search sees whatever a
-    /// failed commit had already published (Issue #1435).
+    /// Returns an error if the writer commit, deletion persistence, storage
+    /// sync, or index refresh fails. The cached searcher is dropped on every
+    /// return, so the next search sees whatever a failed commit had already
+    /// published (Issue #1435).
     pub async fn commit(&self) -> Result<()> {
         self.commit_with_checkpoint(None).await
     }
@@ -791,30 +796,42 @@ impl VectorStore {
             *self.searcher_cache.write() = None;
             return Err(e);
         }
-        let ladder_result = Ok(())
-            // Persist any pending logical deletions (Issue #624) so the
-            // deletion bitmap survives restarts. The WAL also records
-            // deletions, so this is a durability optimization rather than the
-            // source of truth.
-            .and_then(|_| self.index.persist_deletions())
-            // Automatically compact when the deletion ratio crosses the
-            // configured threshold (Issue #782), so logically deleted vectors
-            // are physically reclaimed rather than accumulating indefinitely.
-            // A no-op unless the index supports it and `auto_compaction` is
-            // enabled.
-            .and_then(|_| self.index.maybe_auto_compact());
-        let finished = match ladder_result {
-            Ok(compacted) => {
+        // Persist any pending logical deletions (Issue #624) so the deletion
+        // bitmap survives restarts, and publish the WAL checkpoint. The WAL
+        // also records deletions, so this is a durability optimization
+        // rather than the source of truth.
+        let finished = match self.index.persist_deletions() {
+            Ok(()) => {
+                // Merge segments, and compact when the deletion ratio crosses
+                // the configured threshold (Issue #782), so logically deleted
+                // vectors are physically reclaimed rather than accumulating
+                // indefinitely. This commit's changes and checkpoint are
+                // durable by now, so a failed merge does not fail the commit
+                // (Issue #1500): failing it would stop the engine before it
+                // commits the documents and truncates the WAL, on every later
+                // commit too while the cause stays. The next commit retries
+                // the merge.
+                let compacted = match self.index.maybe_auto_compact() {
+                    Ok(compacted) => compacted,
+                    Err(e) => {
+                        log::warn!(
+                            "vector commit succeeded, but the automatic merge after it failed \
+                             and is retried on the next commit: {e}"
+                        );
+                        // A compaction that failed partway may already have
+                        // rewritten the index and cleared the deletion
+                        // bitmap behind the writer, as a finished one does.
+                        true
+                    }
+                };
                 if compacted || !self.index.retain_writer_after_commit() {
                     *writer_guard = None;
                 }
                 Ok(())
             }
             Err(e) => {
-                // A mid-ladder failure leaves the writer/disk agreement
-                // unknown — compaction in particular may have partially
-                // rewritten the index and cleared the deletion bitmap before
-                // failing. Drop the cache so the next writer reloads ground
+                // A failed persistence leaves the writer/disk agreement
+                // unknown. Drop the cache so the next writer reloads ground
                 // truth from storage (the pre-retention behavior on every
                 // path), instead of retrying — or resurrecting from — a
                 // stale writer.
@@ -830,11 +847,11 @@ impl VectorStore {
             // directory is synced.
             .and_then(|()| self.index.storage().sync())
             .and_then(|()| self.index.refresh());
-        // On the error paths too (Issue #1435): the flush above, or a
-        // compaction that failed partway, may already have changed the
-        // segment set, and a searcher fixes its segment set when it is
-        // built, so keeping it would hide those changes from every search
-        // until the next successful commit.
+        // On the error paths too (Issue #1435): the flush above, or a merge
+        // that failed partway, may already have changed the segment set,
+        // and a searcher fixes its segment set when it is built, so keeping
+        // it would hide those changes from every search until the next
+        // successful commit.
         *self.searcher_cache.write() = None;
         finished
     }
@@ -1612,7 +1629,11 @@ impl VectorStore {
     /// If the underlying index's embedder is a
     /// [`PerFieldEmbedder`](crate::embedding::per_field::PerFieldEmbedder),
     /// this method registers the given embedder for the specified field.
-    /// The writer and searcher caches are invalidated afterwards.
+    ///
+    /// The field starts empty, also under the name of a field that
+    /// [`Self::delete_field`] removed: [`VectorIndex::add_field`] discards
+    /// the files that field left (Issue #1535). The cached writer is
+    /// committed and dropped first, and the cached searcher is dropped.
     ///
     /// # Arguments
     ///
@@ -1624,15 +1645,41 @@ impl VectorStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if creating the field's sub-index fails (e.g. the
-    /// field already exists, or a storage I/O error).
+    /// Returns an error if committing the cached writer's pending changes
+    /// fails, leaving the index unchanged and the writer cached for the next
+    /// [`Self::commit`] to retry, or if creating the field's sub-index fails
+    /// (e.g. the field already exists, or a storage I/O error).
     pub async fn add_field(
         &self,
         name: &str,
         vector_opt: &crate::vector::core::field::FieldOption,
         embedder: Option<Arc<dyn crate::embedding::embedder::Embedder>>,
     ) -> Result<()> {
-        if self.index.supports_dynamic_fields() {
+        // Commit the cached writer before the index changes, and fail if
+        // that fails, as `rebuild_field` does. The writer holds a sub-writer
+        // for every field it was made for: one kept from a failed commit in
+        // `delete_field` holds the removed field's, whose commit after the
+        // re-add would write that field's old manifest back into the
+        // directory the re-add emptied (Issue #1535). A failed writer stays
+        // cached (#882 review / #875): its buffered mutations are the only
+        // in-process copy. The lock is held until the field is registered,
+        // so no writer is made without it, and nothing awaits after the
+        // index changes (Issue #1530).
+        let mut writer_guard = self.writer_cache.lock().await;
+        let flush_result = match writer_guard.as_mut() {
+            Some(writer) if writer.has_pending_changes() => writer.commit(),
+            _ => Ok(()),
+        };
+        // A failed flush may still have sealed other fields' segments, as in
+        // `optimize` (Issue #1435).
+        if let Err(e) = flush_result {
+            drop(writer_guard);
+            *self.searcher_cache.write() = None;
+            return Err(e);
+        }
+        *writer_guard = None;
+
+        let added = if self.index.supports_dynamic_fields() {
             let deletion_config = self
                 .config
                 .as_ref()
@@ -1643,46 +1690,31 @@ impl VectorStore {
                 self.index.embedder(),
                 &deletion_config,
             );
-            self.index.add_field(name, field_config)?;
-        }
+            self.index.add_field(name, field_config)
+        } else {
+            Ok(())
+        };
 
-        self.base_weights.write().insert(
-            name.to_string(),
-            Self::sanitize_base_weight(vector_opt.base_weight()),
-        );
+        if added.is_ok() {
+            self.base_weights.write().insert(
+                name.to_string(),
+                Self::sanitize_base_weight(vector_opt.base_weight()),
+            );
 
-        if let Some(field_embedder) = embedder {
-            let index_embedder = self.index.embedder();
-            if let Some(pfe) = index_embedder
-                .as_any()
-                .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
-            {
-                pfe.add_embedder(name, field_embedder);
+            if let Some(field_embedder) = embedder {
+                let index_embedder = self.index.embedder();
+                if let Some(pfe) = index_embedder
+                    .as_any()
+                    .downcast_ref::<crate::embedding::per_field::PerFieldEmbedder>()
+                {
+                    pfe.add_embedder(name, field_embedder);
+                }
             }
         }
 
-        // Invalidate caches so the next writer/searcher uses updated config.
-        // Commit the cached writer first and KEEP it on failure (#882
-        // review / #875): its buffered mutations are the only in-process
-        // copy, and the segmented pending WAL checkpoint may already cover
-        // them — a bare drop would let a later successful commit's
-        // checkpoint hide the loss from recovery. A commit failure here is
-        // intentionally not propagated (pre-existing behavior): leaving
-        // the writer cached makes the next `commit()` retry and surface
-        // it instead.
-        {
-            let mut writer_guard = self.writer_cache.lock().await;
-            if let Some(writer) = writer_guard.as_mut()
-                && writer.has_pending_changes()
-                && writer.commit().is_err()
-            {
-                *self.searcher_cache.write() = None;
-                return Ok(());
-            }
-            *writer_guard = None;
-        }
+        drop(writer_guard);
         *self.searcher_cache.write() = None;
-        Ok(())
+        added
     }
 
     /// Remove a field from the vector store.
@@ -1691,8 +1723,18 @@ impl VectorStore {
     /// [`VectorIndex::remove_field`], a no-op for index types without
     /// field boundaries) and any field-specific embedder from the
     /// `PerFieldEmbedder`, then invalidates writer/searcher caches.
-    /// Existing vector data in the index is not deleted -- re-adding the
-    /// field with the same name recovers it.
+    /// The field's files stay on storage, but its data is not recovered:
+    /// [`Self::add_field`] with the same name discards the files and starts
+    /// the field empty (Issue #1535). From removal on, deletes no longer
+    /// reach the field, so its data would bring deleted documents back.
+    ///
+    /// The writer lock is taken before anything changes, as in
+    /// [`Self::add_field`], so nothing awaits after the index changes: a
+    /// call dropped while it waits for a commit that holds the writer has
+    /// removed nothing (Issue #1530). A failed commit of the cached writer
+    /// is not an error: the writer stays cached, still holding the removed
+    /// field's buffered vectors, and [`Self::add_field`] commits it before
+    /// it adds the field again.
     ///
     /// # Arguments
     ///
@@ -1703,6 +1745,12 @@ impl VectorStore {
     /// Returns an error if unregistering the field from the underlying
     /// index fails.
     pub async fn delete_field(&self, name: &str) -> Result<()> {
+        // Taken before the index changes, as in `add_field`: waiting for it
+        // after the removal let a cancelled call leave the field in the
+        // engine's schema but not in the index, where a later put of the
+        // field failed after its WAL append and stopped writes (Issue #1530).
+        let mut writer_guard = self.writer_cache.lock().await;
+
         // `purge: false` -- this method's existing "unregister only"
         // contract (documented above) is unchanged; physical deletion is
         // opt-in via `Self::rebuild_field` (Issue #1080).
@@ -1716,17 +1764,14 @@ impl VectorStore {
         // Same commit-then-drop-on-success guard as `add_field` (#882
         // review): never rely on a bare drop while buffered mutations are
         // the only in-process copy.
-        {
-            let mut writer_guard = self.writer_cache.lock().await;
-            if let Some(writer) = writer_guard.as_mut()
-                && writer.has_pending_changes()
-                && writer.commit().is_err()
-            {
-                *self.searcher_cache.write() = None;
-                return Ok(());
-            }
+        let committed = match writer_guard.as_mut() {
+            Some(writer) if writer.has_pending_changes() => writer.commit().is_ok(),
+            _ => true,
+        };
+        if committed {
             *writer_guard = None;
         }
+        drop(writer_guard);
         *self.searcher_cache.write() = None;
         Ok(())
     }
@@ -1764,11 +1809,19 @@ impl VectorStore {
     /// [`FieldChangeKind::Reindex`]: crate::engine::schema::FieldChangeKind::Reindex
     /// [`FieldChangeKind::Destructive`]: crate::engine::schema::FieldChangeKind::Destructive
     ///
+    /// A rebuild keeps the deletes and re-adds made since the last commit
+    /// (Issue #1527). A soft delete takes no writer lock, so the caller must
+    /// not delete documents while this runs: a delete that lands on the
+    /// field's index being replaced is lost. `Engine::update_field` blocks
+    /// deletes for the whole call.
+    ///
     /// # Errors
     ///
     /// Returns an error if flushing a cached writer's pending changes
-    /// fails, or if the underlying rebuild (`purge: false`) or purge +
-    /// recreate (`purge: true`) fails. Unlike [`Self::add_field`]/
+    /// fails, if the underlying rebuild (`purge: false`) fails before it
+    /// publishes the rewritten segments, which leaves the field as it was
+    /// (see [`VectorIndex::rebuild_field`]), or if the purge + recreate
+    /// (`purge: true`) fails. Unlike [`Self::add_field`]/
     /// [`Self::delete_field`], a flush failure is **propagated**, not
     /// cached for a later retry — the writer's buffered state is not a
     /// safe starting point for a rebuild, the same reasoning
@@ -1856,7 +1909,7 @@ impl VectorStore {
 /// Taken with [`VectorStore::lock_writer`] or
 /// [`VectorStore::lock_writer_for_delete`], the last steps of a mutation
 /// that can wait. Its methods are synchronous, so the engine runs a
-/// mutation from its first WAL append to its finish without an await, and
+/// mutation from its WAL append to its finish without an await, and
 /// dropping the mutation's future cannot interrupt it there.
 ///
 /// Dropping it releases the writer, then drops the cached searcher if a
@@ -2218,6 +2271,9 @@ mod tests {
             self.check(IndexCall::PersistDeletions)?;
             self.inner.persist_deletions()
         }
+        fn write_deletions(&self) -> Result<()> {
+            self.inner.write_deletions()
+        }
         fn maybe_auto_compact(&self) -> Result<bool> {
             self.check(IndexCall::MaybeAutoCompact)?;
             self.inner.maybe_auto_compact()
@@ -2476,15 +2532,144 @@ mod tests {
         assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
     }
 
-    /// Issue #1435 — as above, for a failed auto-compaction.
+    /// Issues #1435 and #1500 — a failed auto-compaction does not fail the
+    /// commit, whose changes are durable by then, and the commit still drops
+    /// the searcher built before it.
     #[tokio::test]
-    async fn commit_failing_to_auto_compact_drops_stale_searcher() {
+    async fn commit_whose_auto_compact_fails_succeeds_and_drops_stale_searcher() {
         let fixture = store_with_stale_searcher().await;
         *fixture.armed.lock() = Some(IndexCall::MaybeAutoCompact);
-        assert!(fixture.store.commit().await.is_err());
+        fixture.store.commit().await.unwrap();
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1500 — the storage sync still runs after a failed
+    /// auto-compaction, and its own failure still fails the commit: the sync
+    /// makes the deletion bitmap's rename durable before the engine
+    /// truncates the WAL.
+    #[tokio::test]
+    async fn commit_whose_auto_compact_fails_still_fails_on_a_failed_sync() {
+        let fixture = store_with_stale_searcher().await;
+        *fixture.armed.lock() = Some(IndexCall::MaybeAutoCompact);
+        fixture
+            .store_storage
+            .fail_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(fixture.store.commit().await.is_err());
+        fixture.assert_failure_hit();
+    }
+
+    /// Makes the commit in `delete_field("a")` fail sealing doc 2 into `a`,
+    /// so the store keeps the writer, which still holds `a`'s sub-writer.
+    async fn delete_field_a_keeping_the_writer(fixture: &StaleSearcherFixture) {
+        *fixture.index_storage.fail_create_prefix.lock() = Some("a/");
+        fixture.store.delete_field("a").await.unwrap();
+        fixture.assert_failure_hit();
+    }
+
+    /// Issue #1535 — `add_field` commits a writer kept from a failed commit
+    /// before it re-adds the field. Committed after the re-add, the removed
+    /// field's sub-writer would write its old manifest into the directory
+    /// the re-add emptied, naming segment files that are gone.
+    #[tokio::test]
+    async fn re_add_commits_a_kept_writer_before_it_empties_the_field() {
+        let fixture = store_with_stale_searcher().await;
+        delete_field_a_keeping_the_writer(&fixture).await;
+
+        let option = crate::vector::core::field::FieldOption::Flat(flat_option());
+        fixture.store.add_field("a", &option, None).await.unwrap();
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), Vec::<u64>::new());
+        assert_eq!(search_ids(&fixture.store, "b").unwrap(), vec![1, 2]);
+
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let reopened = VectorStore::new(fixture.index_storage.clone(), config).unwrap();
+        assert_eq!(search_ids(&reopened, "a").unwrap(), Vec::<u64>::new());
+        assert_eq!(search_ids(&reopened, "b").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1535 — while the kept writer's commit fails, `add_field`
+    /// returns the error before it changes the index: the field is not
+    /// registered and the removed field's files stay.
+    #[tokio::test]
+    async fn re_add_fails_while_the_kept_writer_cannot_commit() {
+        let fixture = store_with_stale_searcher().await;
+        delete_field_a_keeping_the_writer(&fixture).await;
+
+        let option = crate::vector::core::field::FieldOption::Flat(flat_option());
+        *fixture.index_storage.fail_create_prefix.lock() = Some("a/");
+        assert!(fixture.store.add_field("a", &option, None).await.is_err());
+        fixture.assert_failure_hit();
+        assert!(!fixture.store.index.field_dimensions().contains_key("a"));
+        assert!(fixture.index_storage.file_exists("a/segments.json"));
+
+        fixture.store.add_field("a", &option, None).await.unwrap();
+        assert_eq!(search_ids(&fixture.store, "a").unwrap(), Vec::<u64>::new());
+    }
+
+    /// Issue #1500 — a failed auto-compaction drops a retained writer, as a
+    /// finished one does: a compaction that failed partway may already have
+    /// rewritten the index behind it, and the writer would then write the
+    /// reclaimed vectors back on its next commit.
+    #[tokio::test]
+    async fn commit_whose_auto_compact_fails_drops_the_retained_writer() {
+        use crate::vector::index::config::HnswIndexConfig;
+
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexTypeConfig::HNSW(HnswIndexConfig {
+            dimension: 4,
+            segmented: false,
+            ..Default::default()
+        });
+        let inner =
+            VectorIndexFactory::open_or_create(storage.clone(), "vector_index", config).unwrap();
+        assert!(
+            inner.retain_writer_after_commit(),
+            "precondition: the monolithic HNSW index retains its writer"
+        );
+        let armed = Arc::new(parking_lot::Mutex::new(None));
+        let store = VectorStore {
+            index: Box::new(FailingIndex {
+                inner,
+                armed: armed.clone(),
+                storage,
+            }),
+            writer_cache: Mutex::new(None),
+            searcher_cache: parking_lot::RwLock::new(None),
+            config: None,
+            base_weights: parking_lot::RwLock::new(HashMap::new()),
+            pooling_budget: PoolingBudget::for_this_machine(),
+        };
+        let upsert = |doc_id: u64| {
+            let doc = Document::builder()
+                .add_field("vec", DataValue::Vector(vec![doc_id as f32; 4]))
+                .build();
+            store.upsert_document_by_internal_id(doc_id, doc)
+        };
+
+        upsert(1).await.unwrap();
+        store.commit().await.unwrap();
+        assert!(
+            store.writer_cache.lock().await.is_some(),
+            "precondition: a commit keeps the writer"
+        );
+
+        upsert(2).await.unwrap();
+        *armed.lock() = Some(IndexCall::MaybeAutoCompact);
+        store.commit().await.unwrap();
+        assert!(armed.lock().is_none(), "the index failure was not hit");
+        assert!(
+            store.writer_cache.lock().await.is_none(),
+            "a failed auto-compaction must drop the retained writer"
+        );
     }
 
     /// Issue #1435 — as above, for a failed storage sync.
@@ -2604,6 +2789,46 @@ mod tests {
         fixture.assert_failure_hit();
 
         assert_eq!(search_ids(&fixture.store, "a").unwrap(), vec![1, 2]);
+    }
+
+    /// Issue #1527 — a document re-added under the id it was deleted with,
+    /// without a commit, survives a rebuild. The re-add clears the mark in
+    /// memory while the field's `.delmap` still holds it, so a rebuild that
+    /// read the marks from storage only dropped both versions. Ten documents
+    /// keep one delete below the auto-compaction threshold, which would
+    /// otherwise reclaim the mark at the commit.
+    #[tokio::test]
+    async fn rebuild_keeps_a_document_re_added_since_the_last_commit() {
+        let storage: Arc<dyn Storage> =
+            Arc::new(MemoryStorage::new(MemoryStorageConfig::default()));
+        let config = VectorIndexConfig::builder()
+            .add_field("a", flat_option())
+            .unwrap()
+            .add_field("b", flat_option())
+            .unwrap()
+            .build()
+            .unwrap();
+        let store = VectorStore::new(storage.clone(), config).unwrap();
+        for doc_id in 1..=10 {
+            put_doc(&store, doc_id).await;
+        }
+        store.commit().await.unwrap();
+        store.delete_document_by_internal_id(1).await.unwrap();
+        store.commit().await.unwrap();
+        assert!(
+            storage.file_exists("a/index.delmap"),
+            "the committed delete is on storage"
+        );
+
+        put_doc(&store, 1).await;
+        store
+            .rebuild_field("a", &flat_option().into(), FieldEmbedderChange::Keep, false)
+            .await
+            .unwrap();
+        let all: Vec<u64> = (1..=10).collect();
+        assert_eq!(search_ids(&store, "a").unwrap(), all);
+        store.commit().await.unwrap();
+        assert_eq!(search_ids(&store, "a").unwrap(), all);
     }
 
     /// Issue #1457 — a purge to a Flat or IVF option with a product

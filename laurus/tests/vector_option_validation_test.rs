@@ -336,18 +336,18 @@ async fn index_persisted_with_an_unusable_subvector_count_opens_and_update_field
 #[tokio::test(flavor = "multi_thread")]
 async fn index_persisted_with_an_unsupported_pq_metric_opens_and_can_be_repaired() {
     let dir = TempDir::new().unwrap();
-    let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
-        .await
-        .unwrap();
-    put_four(&engine).await;
-    drop(engine);
-
     let persisted = Schema::from_toml(
         &schema_with(hnsw_pq_with_distance(2, DistanceMetric::DotProduct))
             .to_toml()
             .unwrap(),
     )
     .unwrap();
+    let engine = Engine::new(create_storage(&dir), persisted.clone())
+        .await
+        .unwrap();
+    put_four(&engine).await;
+    drop(engine);
+
     let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
     let outcome = engine
         .update_field("vec", hnsw_pq(2), REINDEX)
@@ -374,18 +374,18 @@ async fn index_persisted_with_an_unsupported_pq_metric_opens_and_can_be_repaired
 #[tokio::test(flavor = "multi_thread")]
 async fn index_persisted_with_an_unsupported_pq_metric_reindexes_vectors_when_repaired() {
     let dir = TempDir::new().unwrap();
-    let engine = Engine::new(create_storage(&dir), schema_with(hnsw_pq(2)))
-        .await
-        .unwrap();
-    put_four(&engine).await;
-    drop(engine);
-
     let persisted = Schema::from_toml(
         &schema_with(hnsw_pq_with_distance(2, DistanceMetric::DotProduct))
             .to_toml()
             .unwrap(),
     )
     .unwrap();
+    let engine = Engine::new(create_storage(&dir), persisted.clone())
+        .await
+        .unwrap();
+    put_four(&engine).await;
+    drop(engine);
+
     let engine = Engine::new(open_storage(&dir), persisted).await.unwrap();
     let repaired = FieldOption::Hnsw(HnswOption::new(DIM).distance(DistanceMetric::DotProduct));
     let outcome = engine.update_field("vec", repaired, REINDEX).await.unwrap();
